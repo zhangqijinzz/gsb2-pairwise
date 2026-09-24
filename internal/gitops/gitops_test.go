@@ -1,0 +1,441 @@
+package gitops
+
+import (
+	"context"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+)
+
+// TestHelperProcess is not a real test. It is invoked as a subprocess to
+// provide cross-platform mocks for external binaries (e.g. git).
+func TestHelperProcess(t *testing.T) {
+	if os.Getenv("GO_TEST_SUBPROCESS") != "1" {
+		return
+	}
+	switch os.Getenv("GO_TEST_SUBPROCESS_MODE") {
+	case "git_sleep":
+		fmt.Fprintln(os.Stderr, "fake clone starting")
+		// Sleep until killed by the OS. time.Sleep keeps a timer goroutine alive,
+		// so the Go deadlock detector does not fire prematurely. select{} would
+		// cause all goroutines to be permanently parked, triggering the detector
+		// in ~10 ms and exiting before the context deadline.
+		time.Sleep(24 * time.Hour)
+		os.Exit(0)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown GO_TEST_SUBPROCESS_MODE: %s\n", os.Getenv("GO_TEST_SUBPROCESS_MODE"))
+		os.Exit(1)
+	}
+}
+
+// createMockGitExecutable returns a path to a platform-appropriate executable
+// that pretends to be git and blocks until killed.
+func createMockGitExecutable(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if runtime.GOOS == "windows" {
+		// timeout.exe exits immediately with code 1 when there is no console
+		// (non-interactive CI). Use ping to 127.0.0.1 instead — it works without
+		// a console, keeps running for ~34 s, and does not spawn the test binary
+		// (which would file-lock gitops.test.exe during cleanup).
+		path := filepath.Join(dir, "git.bat")
+		content := "@echo off\r\necho fake clone starting 1>&2\r\nping -n 35 127.0.0.1 >nul 2>&1\r\n"
+		if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+			t.Fatalf("os.WriteFile(%s) error = %v", path, err)
+		}
+		return dir
+	}
+	testExe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable() error = %v", err)
+	}
+	path := filepath.Join(dir, "git")
+	content := fmt.Sprintf(
+		"#!/bin/sh\ntrap 'exit 143' TERM INT\nprintf 'fake clone starting\\n' >&2\nGO_TEST_SUBPROCESS=1 GO_TEST_SUBPROCESS_MODE=git_sleep exec %q -test.run=TestHelperProcess\n",
+		testExe,
+	)
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+		t.Fatalf("os.WriteFile(%s) error = %v", path, err)
+	}
+	return dir
+}
+
+func TestBuildGitAuthEnvUsesExtraHeader(t *testing.T) {
+	env := buildGitAuthEnv("https://github.com/example/repo.git", "alice", "secret-token", false)
+	envMap := make(map[string]string, len(env))
+	for _, item := range env {
+		key, value, ok := strings.Cut(item, "=")
+		if !ok {
+			t.Fatalf("invalid env item: %q", item)
+		}
+		envMap[key] = value
+	}
+
+	if envMap["GIT_TERMINAL_PROMPT"] != "0" {
+		t.Fatalf("GIT_TERMINAL_PROMPT = %q, want 0", envMap["GIT_TERMINAL_PROMPT"])
+	}
+	if envMap["GIT_CONFIG_COUNT"] != "1" {
+		t.Fatalf("GIT_CONFIG_COUNT = %q, want 1", envMap["GIT_CONFIG_COUNT"])
+	}
+	if envMap["GIT_CONFIG_KEY_0"] != "http.https://github.com/.extraHeader" {
+		t.Fatalf("GIT_CONFIG_KEY_0 = %q", envMap["GIT_CONFIG_KEY_0"])
+	}
+
+	header := envMap["GIT_CONFIG_VALUE_0"]
+	if !strings.HasPrefix(header, "Authorization: Basic ") {
+		t.Fatalf("GIT_CONFIG_VALUE_0 = %q, want Basic auth header", header)
+	}
+
+	rawValue := strings.TrimPrefix(header, "Authorization: Basic ")
+	decoded, err := base64.StdEncoding.DecodeString(rawValue)
+	if err != nil {
+		t.Fatalf("DecodeString() error = %v", err)
+	}
+	if string(decoded) != "alice:secret-token" {
+		t.Fatalf("decoded header = %q, want alice:secret-token", decoded)
+	}
+}
+
+func TestBuildGitAuthEnvDisablesPromptWithoutCredentials(t *testing.T) {
+	env := buildGitAuthEnv("https://github.com/example/repo.git", "", "", false)
+	if len(env) != 1 || env[0] != "GIT_TERMINAL_PROMPT=0" {
+		t.Fatalf("env = %v, want only GIT_TERMINAL_PROMPT=0", env)
+	}
+}
+
+func TestBuildGitAuthEnvCanDisableTLSVerification(t *testing.T) {
+	env := buildGitAuthEnv("https://gitlab.example.com/group/repo.git", "alice", "secret-token", true)
+	envMap := make(map[string]string, len(env))
+	for _, item := range env {
+		key, value, ok := strings.Cut(item, "=")
+		if !ok {
+			t.Fatalf("invalid env item: %q", item)
+		}
+		envMap[key] = value
+	}
+
+	if envMap["GIT_CONFIG_COUNT"] != "2" {
+		t.Fatalf("GIT_CONFIG_COUNT = %q, want 2", envMap["GIT_CONFIG_COUNT"])
+	}
+	if envMap["GIT_CONFIG_KEY_0"] != "http.https://gitlab.example.com/.sslVerify" {
+		t.Fatalf("GIT_CONFIG_KEY_0 = %q", envMap["GIT_CONFIG_KEY_0"])
+	}
+	if envMap["GIT_CONFIG_VALUE_0"] != "false" {
+		t.Fatalf("GIT_CONFIG_VALUE_0 = %q, want false", envMap["GIT_CONFIG_VALUE_0"])
+	}
+	if envMap["GIT_CONFIG_KEY_1"] != "http.https://gitlab.example.com/.extraHeader" {
+		t.Fatalf("GIT_CONFIG_KEY_1 = %q", envMap["GIT_CONFIG_KEY_1"])
+	}
+}
+
+func TestFormatGitCommandErrorIncludesOutputAndMasksSecrets(t *testing.T) {
+	err := formatGitCommandError(
+		errors.New("exit status 128"),
+		[]byte("remote: token secret-token rejected\nfatal: Authentication failed\n"),
+		"alice",
+		"secret-token",
+	)
+
+	message := err.Error()
+	if !strings.Contains(message, "exit status 128") {
+		t.Fatalf("error = %q, want exit status", message)
+	}
+	if !strings.Contains(message, "Authentication failed") {
+		t.Fatalf("error = %q, want git output", message)
+	}
+	if strings.Contains(message, "secret-token") {
+		t.Fatalf("error leaked token: %q", message)
+	}
+}
+
+func TestCloneWithProgressHonorsContextCancellation(t *testing.T) {
+	root := t.TempDir()
+	fakeBin := createMockGitExecutable(t)
+
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := CloneWithProgress(ctx, "https://example.com/demo.git", filepath.Join(root, "clone"), "", "", false, func(string) {})
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CloneWithProgress() error = %v, want context deadline exceeded", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("CloneWithProgress() elapsed = %v, want prompt cancellation", elapsed)
+	}
+}
+
+func TestRemoveManagedWorkspaceRejectsOutsideWorkspaceRoot(t *testing.T) {
+	if err := removeManagedWorkspace(t.TempDir()); err == nil {
+		t.Fatalf("expected removeManagedWorkspace() to reject unmanaged path")
+	}
+}
+
+func TestRemoveManagedWorkspaceDeletesManagedWorkspace(t *testing.T) {
+	path := WorkspacePath("owner/repo")
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "README.md"), []byte("demo"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	if err := removeManagedWorkspace(path); err != nil {
+		t.Fatalf("removeManagedWorkspace() error = %v", err)
+	}
+
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("workspace path should be removed, stat err = %v", err)
+	}
+}
+
+func TestCopyProjectDirectoryInitializesGitRepoForGitSource(t *testing.T) {
+	root := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	src := filepath.Join(root, "source")
+	dst := filepath.Join(root, "copy")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "README.md"), []byte("demo"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	initTestGitRepo(t, src, "review-base")
+	gitInDir(t, src, "config", "--global", "user.name", "zhouwei")
+	gitInDir(t, src, "config", "--global", "user.email", "zhouwei@holdzone.cn")
+	gitInDir(t, src, "add", "README.md")
+	gitInDir(t, src, "commit", "-m", "initial source snapshot")
+
+	if err := CopyProjectDirectory(context.Background(), src, dst); err != nil {
+		t.Fatalf("CopyProjectDirectory() error = %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dst, ".git")); err != nil {
+		t.Fatalf("expected destination to have git metadata, stat err = %v", err)
+	}
+
+	status := gitOutput(t, dst, "status", "--short")
+	if strings.TrimSpace(status) != "" {
+		t.Fatalf("git status --short = %q, want clean working tree", status)
+	}
+
+	branch := gitOutput(t, dst, "branch", "--show-current")
+	if branch != "review-base" {
+		t.Fatalf("branch = %q, want review-base", branch)
+	}
+
+	message := gitOutput(t, dst, "log", "-1", "--pretty=%s")
+	if message != localSnapshotCommitMsg {
+		t.Fatalf("last commit message = %q, want %q", message, localSnapshotCommitMsg)
+	}
+
+	author := gitOutput(t, dst, "log", "-1", "--pretty=%an <%ae>")
+	if author != "zhouwei <zhouwei@holdzone.cn>" {
+		t.Fatalf("last commit author = %q", author)
+	}
+}
+
+func TestCopyProjectDirectoryLeavesPlainSourceWithoutGitRepo(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "plain-source")
+	dst := filepath.Join(root, "plain-copy")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "README.md"), []byte("demo"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	if err := CopyProjectDirectory(context.Background(), src, dst); err != nil {
+		t.Fatalf("CopyProjectDirectory() error = %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dst, ".git")); !os.IsNotExist(err) {
+		t.Fatalf("expected destination to remain plain copy, stat err = %v", err)
+	}
+}
+
+func TestCopyProjectDirectorySkipsNodeModulesByDefault(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "source")
+	dst := filepath.Join(root, "copy")
+	packageDir := filepath.Join(src, "node_modules", ".pnpm", "demo@1.0.0", "node_modules", "demo")
+	if err := os.MkdirAll(packageDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(packageDir) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "README.md"), []byte("demo"), 0o644); err != nil {
+		t.Fatalf("WriteFile(README.md) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(packageDir, "index.js"), []byte("module.exports = {}"), 0o644); err != nil {
+		t.Fatalf("WriteFile(index.js) error = %v", err)
+	}
+	if err := os.Symlink(packageDir, filepath.Join(src, "node_modules", "demo")); err != nil {
+		t.Skipf("Symlink() unavailable: %v", err)
+	}
+
+	if err := CopyProjectDirectory(context.Background(), src, dst); err != nil {
+		t.Fatalf("CopyProjectDirectory() error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "README.md")); err != nil {
+		t.Fatalf("expected source file to be copied, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "node_modules")); !os.IsNotExist(err) {
+		t.Fatalf("node_modules should be skipped by default, stat err = %v", err)
+	}
+}
+
+func TestCopyProjectDirectoryPreservesSymbolicLinks(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "source")
+	dst := filepath.Join(root, "copy")
+	targetDir := filepath.Join(src, "packages", "shared")
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(targetDir) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "README.md"), []byte("shared"), 0o644); err != nil {
+		t.Fatalf("WriteFile(README.md) error = %v", err)
+	}
+	if err := os.Symlink("shared", filepath.Join(src, "packages", "current")); err != nil {
+		t.Skipf("Symlink() unavailable: %v", err)
+	}
+
+	if err := CopyProjectDirectory(context.Background(), src, dst); err != nil {
+		t.Fatalf("CopyProjectDirectory() error = %v", err)
+	}
+	linkPath := filepath.Join(dst, "packages", "current")
+	info, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatalf("Lstat(copied link) error = %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("copied path mode = %v, want symlink", info.Mode())
+	}
+	target, err := os.Readlink(linkPath)
+	if err != nil {
+		t.Fatalf("Readlink(copied link) error = %v", err)
+	}
+	if target != "shared" {
+		t.Fatalf("copied link target = %q, want %q", target, "shared")
+	}
+}
+
+func TestEnsureProjectGitignoreCreatesNodeDefaults(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"scripts":{"dev":"vite"}}`), 0o644); err != nil {
+		t.Fatalf("WriteFile(package.json) error = %v", err)
+	}
+
+	if err := EnsureProjectGitignore(root); err != nil {
+		t.Fatalf("EnsureProjectGitignore() error = %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(root, ".gitignore"))
+	if err != nil {
+		t.Fatalf("ReadFile(.gitignore) error = %v", err)
+	}
+	text := string(content)
+	for _, want := range []string{"Generated by PINRU", "node_modules/", "dist/", ".DS_Store"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf(".gitignore missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestEnsureProjectGitignoreDoesNotOverwriteExistingFile(t *testing.T) {
+	root := t.TempDir()
+	gitignorePath := filepath.Join(root, ".gitignore")
+	original := "custom-ignore\n"
+	if err := os.WriteFile(gitignorePath, []byte(original), 0o644); err != nil {
+		t.Fatalf("WriteFile(.gitignore) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatalf("WriteFile(package.json) error = %v", err)
+	}
+
+	if err := EnsureProjectGitignore(root); err != nil {
+		t.Fatalf("EnsureProjectGitignore() error = %v", err)
+	}
+
+	content, err := os.ReadFile(gitignorePath)
+	if err != nil {
+		t.Fatalf("ReadFile(.gitignore) error = %v", err)
+	}
+	if string(content) != original {
+		t.Fatalf(".gitignore = %q, want %q", content, original)
+	}
+}
+
+func TestEnsureProjectGitignoreCombinesDetectedStacks(t *testing.T) {
+	root := t.TempDir()
+	for name, content := range map[string]string{
+		"go.mod":           "module example.com/demo\n",
+		"requirements.txt": "pytest\n",
+		"pom.xml":          "<project />\n",
+	} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(content), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", name, err)
+		}
+	}
+
+	if err := EnsureProjectGitignore(root); err != nil {
+		t.Fatalf("EnsureProjectGitignore() error = %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(root, ".gitignore"))
+	if err != nil {
+		t.Fatalf("ReadFile(.gitignore) error = %v", err)
+	}
+	text := string(content)
+	for _, want := range []string{"# Go", "coverage.out", "# Python", "__pycache__/", "# Java / JVM", "target/"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf(".gitignore missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func initTestGitRepo(t *testing.T, path, branch string) {
+	t.Helper()
+	if err := runGit(path, "init", "-b", branch); err != nil {
+		if err := runGit(path, "init"); err != nil {
+			t.Fatalf("git init error = %v", err)
+		}
+		gitInDir(t, path, "checkout", "-b", branch)
+	}
+	gitInDir(t, path, "config", "user.name", "Test User")
+	gitInDir(t, path, "config", "user.email", "test@example.com")
+}
+
+func gitInDir(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, output)
+	}
+}
+
+func gitOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, output)
+	}
+	return strings.TrimSpace(string(output))
+}

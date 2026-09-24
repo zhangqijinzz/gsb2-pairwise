@@ -1,0 +1,91 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  release:
+    types: [ created ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macos-arm64
+          - os: windows-latest
+            name: windows-amd64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Run CI build script
+        run: node scripts/ci-build.mjs ci
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        env:
+          ARCHIVE_SUFFIX: ${{ matrix.name }}
+        run: |
+          chmod +x scripts/package_macos_app.sh
+          ./scripts/package_macos_app.sh
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path build/bin/pinru.exe -DestinationPath PINRU-${{ matrix.name }}.zip
+
+      # push to main: 上传到 Actions Artifacts
+      - name: Upload artifact
+        if: github.event_name == 'push' && runner.os == 'macOS'
+        uses: actions/upload-artifact@v6
+        with:
+          name: PINRU-${{ matrix.name }}
+          path: dist/PINRU-${{ matrix.name }}.zip
+          retention-days: 30
+
+      - name: Upload artifact
+        if: github.event_name == 'push' && runner.os == 'Windows'
+        uses: actions/upload-artifact@v6
+        with:
+          name: PINRU-${{ matrix.name }}
+          path: PINRU-${{ matrix.name }}.zip
+          retention-days: 30
+
+      # 创建 Release 时: 上传到 Release Assets
+      - name: Upload to Release
+        if: github.event_name == 'release' && runner.os == 'macOS'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/PINRU-${{ matrix.name }}.zip
+
+      - name: Upload to Release
+        if: github.event_name == 'release' && runner.os == 'Windows'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: PINRU-${{ matrix.name }}.zip

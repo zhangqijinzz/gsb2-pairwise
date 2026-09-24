@@ -1,0 +1,3681 @@
+import React, { useEffect, useMemo, useState, useRef } from 'react';
+import clsx from 'clsx';
+import { AnimatePresence, motion } from 'motion/react';
+import {
+  AlertCircle,
+  Check,
+  CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  CircleDashed,
+  Container,
+  Copy,
+  ExternalLink,
+  FileText,
+  Hash,
+  HelpCircle,
+  LayoutDashboard,
+  PlayCircle,
+  Plus,
+  RefreshCw,
+  Settings2,
+  Terminal,
+  ThumbsDown,
+  ThumbsUp,
+  Trash2,
+  UploadCloud,
+  Wand2,
+  X,
+} from 'lucide-react';
+import { useAppStore, type Task, type TaskStatus } from '../../store';
+import type { CodePushRecord } from '../../api/codePush';
+import type { AiReviewPayload, AiReviewResult, BackgroundJob } from '../../api/job';
+import type { AiReviewRoundFromDB, ModelRunFromDB, PromptGenerationStatus, TaskFromDB } from '../../api/task';
+import { saveAiReviewRoundDissatisfactionSummary, saveAiReviewRoundNotes } from '../../api/task';
+import type { GeneratePromptRequest, LlmProviderConfig } from '../../api/llm';
+import { isDeepSeekFlashProvider, polishText as polishTextApi } from '../../api/llm';
+import {
+  DEFAULT_TASK_TYPES,
+  getTaskTypePresentation,
+  normalizeTaskTypeName,
+  supportsQuickAiReviewTaskType,
+} from '../../api/config';
+import {
+  getSessionDecisionValue,
+  isSessionCounted,
+  maskSessionId,
+  summarizeCountedRounds,
+  type EditableTaskSession,
+} from '../lib/sessionUtils';
+import { formatTaskDisplayId } from '../lib/taskId';
+import {
+  matchKindLabel,
+} from '../lib/sessionCandidateUtils';
+import { formatModelRunDisplayLabel } from '../lib/sourceFolders';
+import { CopyIconButton } from './CopyIconButton';
+import { writeClipboardText } from '../lib/clipboard';
+import MarkdownPreview from './MarkdownPreview';
+import { AnnotationWorkspace } from '../../features/annotation';
+
+export type TaskDetailDrawerTab = 'container' | 'sessions' | 'prompt' | 'model-runs' | 'ai-review' | 'readme';
+export type TaskDetailDrawerModelOption = {
+  modelName: string;
+  localPath: string | null;
+};
+
+type ParsedAiReviewJob = {
+  job: BackgroundJob;
+  input: AiReviewPayload | null;
+  output: AiReviewResult | null;
+  modelRunId: string | null;
+  localPath: string | null;
+  displayName: string;
+  details: AiReviewStructuredDetails | null;
+};
+
+type AiReviewStructuredDetails = {
+  isCompleted: boolean | null;
+  isSatisfied: boolean | null;
+  projectType: string | null;
+  changeScope: string | null;
+  keyLocations: string | null;
+};
+
+type AiReviewStatusEntry = {
+  key: string;
+  modelRunId: string | null;
+  displayName: string;
+  localPath: string | null;
+  reviewStatus: string;
+  reviewRound: number;
+  reviewNotes: string | null;
+  nextPrompt: string | null;
+  latestJob: ParsedAiReviewJob | null;
+  isUnlinked: boolean;
+  details: AiReviewStructuredDetails | null;
+};
+
+type StatusMetaMap = Record<TaskStatus, {
+  label: string;
+  dotCls: string;
+  badgeCls: string;
+}>;
+
+type PromptGenerationMeta = {
+  label: string;
+  badgeCls: string;
+  panelCls: string;
+};
+
+type SessionPatch = Partial<Pick<EditableTaskSession, 'sessionId' | 'taskType' | 'consumeQuota' | 'isCompleted' | 'isSatisfied' | 'evaluation' | 'userConversation'>>;
+
+interface TaskDetailDrawerProps {
+  selected: Task;
+  selectedTaskDetail: TaskFromDB | null;
+  selectedTaskReadme: import('../../api/task').TaskReadme | null;
+  selectedModelRuns: ModelRunFromDB[];
+  selectedAiReviewRounds?: AiReviewRoundFromDB[];
+  selectedCodePushRecords?: CodePushRecord[];
+  codePushActionKey?: string | null;
+  drawerLoading: boolean;
+  drawerError: string;
+  statusChanging: boolean;
+  taskTypeChanging: boolean;
+  sessionListDraft: EditableTaskSession[];
+  sessionListSaving: boolean;
+  aiReviewResetting?: boolean;
+  sessionSaveState: 'idle' | 'saved';
+  hasUnsavedSessionChanges: boolean;
+  sessionExtracting: boolean;
+  openSessionEditors: Set<string>;
+  copiedSessionId: string | null;
+  promptDraft: string;
+  promptSaving: boolean;
+  promptSaveState: 'idle' | 'saved';
+  promptCopied: boolean;
+  activeDrawerTab: TaskDetailDrawerTab;
+  sessionModelOptions: TaskDetailDrawerModelOption[];
+  selectedSessionModelName: string;
+  sessionTaskTypeOptions: string[];
+  taskTypeRemainingToCompleteByType: Record<string, number | null>;
+  sourceModelName: string;
+  selectedPromptGenerationStatus: PromptGenerationStatus;
+  selectedPromptGenerationMeta: PromptGenerationMeta;
+  selectedPromptGenerationError: string | null;
+  escCloseHintVisible: boolean;
+  statusMeta: StatusMetaMap;
+  statusOptions: TaskStatus[];
+  onClose: () => void;
+  onStatusChange: (taskId: string, nextStatus: TaskStatus) => void;
+  onTabChange: (tab: TaskDetailDrawerTab) => void;
+  onAddSession: () => void;
+  onCompleteCurrentSessionAndAdd?: () => void | Promise<void>;
+  onAutoExtractSessions: () => void | Promise<void>;
+  onSessionChange: (localId: string, patch: SessionPatch) => void;
+  onToggleSessionEditor: (localId: string) => void;
+  onSessionEditorBlur: (localId: string) => void | Promise<void>;
+  onCopySessionId: (localId: string, sessionId: string) => void | Promise<void>;
+  onRemoveSession: (localId: string) => void;
+  onResetSessions: () => void;
+  onResetAiReview?: () => void | Promise<void>;
+  onSaveSessionList: () => void | Promise<void>;
+  onPromptDraftChange: (value: string) => void;
+  onPromptCopy: () => void | Promise<void>;
+  onPromptReset: () => void;
+  onPromptSave: () => void | Promise<void>;
+  onSessionModelChange: (modelName: string) => void;
+  onOpenSubmit: () => void;
+  llmProviders: LlmProviderConfig[];
+  promptGenerating: boolean;
+  onGeneratePrompt: (config: Omit<GeneratePromptRequest, 'taskId'>) => void | Promise<void>;
+  onAiReview?: (run: ModelRunFromDB) => void;
+  onCommitCode?: (run: ModelRunFromDB) => void | Promise<void>;
+  onRedoCommit?: (record: CodePushRecord) => void | Promise<void>;
+  onPushCode?: (record: CodePushRecord) => void | Promise<void>;
+  onDeleteAiReviewRecord?: (jobId: string) => void | Promise<void>;
+  onResetAiReviewRound?: (roundId: string) => void | Promise<void>;
+  onSubmitNextAiReviewRound?: (modelRunId: string, modelName: string, localPath: string, nextPromptOverride?: string, reviewRoundId?: string) => void | Promise<void>;
+}
+
+const TAB_ITEMS: Array<{ id: TaskDetailDrawerTab; label: string; icon: React.ComponentType<{ className?: string }> }> = [
+  { id: 'container', label: '容器与轨迹', icon: Container },
+  { id: 'sessions', label: 'Session 视图', icon: LayoutDashboard },
+  { id: 'prompt', label: '提示词', icon: Terminal },
+  { id: 'model-runs', label: '执行概况', icon: FileText },
+  { id: 'readme', label: 'README', icon: HelpCircle },
+  { id: 'ai-review', label: 'AI复审', icon: CheckCircle2 },
+];
+
+export default function TaskDetailDrawer({
+  selected,
+  selectedTaskDetail,
+  selectedTaskReadme,
+  selectedModelRuns,
+  selectedCodePushRecords = [],
+  codePushActionKey = null,
+  drawerLoading,
+  drawerError,
+  statusChanging,
+  taskTypeChanging,
+  sessionListDraft,
+  sessionListSaving,
+  aiReviewResetting = false,
+  sessionSaveState,
+  hasUnsavedSessionChanges,
+  sessionExtracting,
+  openSessionEditors,
+  copiedSessionId,
+  promptDraft,
+  promptSaving,
+  promptSaveState,
+  promptCopied,
+  activeDrawerTab,
+  sessionModelOptions,
+  selectedSessionModelName,
+  sessionTaskTypeOptions,
+  taskTypeRemainingToCompleteByType,
+  sourceModelName,
+  selectedPromptGenerationStatus,
+  selectedPromptGenerationMeta,
+  selectedPromptGenerationError,
+  escCloseHintVisible,
+  statusMeta,
+  statusOptions,
+  onClose,
+  onStatusChange,
+  onTabChange,
+  onAddSession,
+  onCompleteCurrentSessionAndAdd,
+  onAutoExtractSessions,
+  onSessionChange,
+  onToggleSessionEditor,
+  onSessionEditorBlur,
+  onCopySessionId,
+  onRemoveSession,
+  onResetSessions,
+  onResetAiReview,
+  onSaveSessionList,
+  onPromptDraftChange,
+  onPromptCopy,
+  onPromptReset,
+  onPromptSave,
+  onSessionModelChange,
+  onOpenSubmit,
+  llmProviders,
+  promptGenerating,
+  onGeneratePrompt,
+  onAiReview,
+  onCommitCode,
+  onRedoCommit,
+  onPushCode,
+  onDeleteAiReviewRecord,
+  onResetAiReviewRound,
+  selectedAiReviewRounds = [],
+  onSubmitNextAiReviewRound,
+}: TaskDetailDrawerProps) {
+  const aiReviewVisible = useAppStore((state) => state.aiReviewVisible);
+  const backgroundJobs = useAppStore((state) => state.backgroundJobs);
+  const CONSTRAINT_OPTIONS = ['技术栈约束', '架构约束', '代码风格约束', '非代码回复约束', '业务逻辑约束', '无约束'];
+  const SCOPE_OPTIONS = ['单文件', '模块内多文件', '跨模块多文件', '跨系统多模块'];
+  const THINKING_OPTIONS: Array<{ value: string; label: string }> = [
+    { value: '', label: '默认' },
+    { value: 'low', label: '低' },
+    { value: 'medium', label: '中' },
+    { value: 'high', label: '高' },
+  ];
+
+  const [runContextMenu, setRunContextMenu] = useState<{
+    run: ModelRunFromDB;
+    x: number;
+    y: number;
+  } | null>(null);
+
+  const [genProviderId, setGenProviderId] = useState<string>('');
+  const [genThinking, setGenThinking] = useState('');
+  const [genTaskType, setGenTaskType] = useState(() =>
+    normalizeTaskTypeName(selected.taskType) || '',
+  );
+  const [genConstraints, setGenConstraints] = useState<Set<string>>(new Set());
+  const [genScopes, setGenScopes] = useState<Set<string>>(new Set());
+  const [genNotes, setGenNotes] = useState('');
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [showRegenForm, setShowRegenForm] = useState(false);
+  const [submitToast, setSubmitToast] = useState(false);
+  const [deletingAiReviewJobId, setDeletingAiReviewJobId] = useState<string | null>(null);
+  const [resettingAiReviewRoundId, setResettingAiReviewRoundId] = useState<string | null>(null);
+  const [deleteAiReviewError, setDeleteAiReviewError] = useState('');
+  const [nextRoundPromptDrafts, setNextRoundPromptDrafts] = useState<Record<string, string>>({});
+  const [nextRoundTaskTypeDrafts, setNextRoundTaskTypeDrafts] = useState<Record<string, string>>({});
+  const [expandedRoundPrompts, setExpandedRoundPrompts] = useState<Set<string>>(new Set());
+  const [polishingKeys, setPolishingKeys] = useState<Set<string>>(new Set());
+  const [polishedNotes, setPolishedNotes] = useState<Record<string, string>>({});
+  const [polishedDissatisfactionSummaries, setPolishedDissatisfactionSummaries] = useState<Record<string, string>>({});
+  const [polishError, setPolishError] = useState<string | null>(null);
+  const [savingRoundNotes, setSavingRoundNotes] = useState<Set<string>>(new Set());
+  const [savingRoundSummaries, setSavingRoundSummaries] = useState<Set<string>>(new Set());
+  const [editingNoteId, setEditingNoteId] = useState<string | null>(null);
+  const [editingNoteDraft, setEditingNoteDraft] = useState('');
+  const [editingSummaryId, setEditingSummaryId] = useState<string | null>(null);
+  const [editingSummaryDraft, setEditingSummaryDraft] = useState('');
+  const [conversationEditMode, setConversationEditMode] = useState<string | null>(null);
+  const [copiedConversation, setCopiedConversation] = useState<string | null>(null);
+  const [sessionIdEditMode, setSessionIdEditMode] = useState<string | null>(null);
+  const [containerPanelTaskId, setContainerPanelTaskId] = useState<string | null>(null);
+  useEffect(() => {
+    if (activeDrawerTab === 'container') setContainerPanelTaskId(selected.id);
+  }, [activeDrawerTab, selected.id]);
+  const [copiedDetailSessionId, setCopiedDetailSessionId] = useState<string | null>(null);
+  const safeLlmProviders = useMemo(
+    () => (Array.isArray(llmProviders) ? llmProviders : []),
+    [llmProviders],
+  );
+  const safeSelectedModelRuns = useMemo(
+    () => (Array.isArray(selectedModelRuns) ? selectedModelRuns : []),
+    [selectedModelRuns],
+  );
+  const codePushRecordsByRunId = useMemo(() => {
+    const map = new Map<string, CodePushRecord[]>();
+    const records = Array.isArray(selectedCodePushRecords) ? selectedCodePushRecords : [];
+    records
+      .slice()
+      .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+      .forEach((record) => {
+        if (!record.modelRunId) {
+          return;
+        }
+        const list = map.get(record.modelRunId) ?? [];
+        list.push(record);
+        map.set(record.modelRunId, list);
+      });
+    return map;
+  }, [selectedCodePushRecords]);
+  const promptLlmProviders = useMemo(
+    () => safeLlmProviders.filter(isDeepSeekFlashProvider),
+    [safeLlmProviders],
+  );
+  const quickAiReviewEnabledForTaskType = useMemo(
+    () => supportsQuickAiReviewTaskType(selected.taskType),
+    [selected.taskType],
+  );
+
+  useEffect(() => {
+    if (promptLlmProviders.length === 0) {
+      if (genProviderId) {
+        setGenProviderId('');
+      }
+      return;
+    }
+    if (promptLlmProviders.some((provider) => provider.id === genProviderId)) {
+      return;
+    }
+
+    const defaultProvider =
+      promptLlmProviders.find((provider) => provider.isDefault) ?? promptLlmProviders[0];
+    if (defaultProvider) {
+      setGenProviderId(defaultProvider.id);
+    }
+  }, [promptLlmProviders, genProviderId]);
+
+  useEffect(() => {
+    if (sessionTaskTypeOptions.length === 0) return;
+    const normalized = normalizeTaskTypeName(selected.taskType);
+    const preferred = normalized && sessionTaskTypeOptions.includes(normalized)
+      ? normalized
+      : sessionTaskTypeOptions[0];
+    if (!genTaskType || !sessionTaskTypeOptions.includes(genTaskType)) {
+      setGenTaskType(preferred);
+    }
+  }, [sessionTaskTypeOptions, selected.taskType]);
+
+  useEffect(() => {
+    setDeletingAiReviewJobId(null);
+    setDeleteAiReviewError('');
+  }, [selected.id]);
+
+  const toggleGenConstraint = (c: string) => {
+    setGenConstraints(prev => {
+      const next = new Set(prev);
+      if (c === '无约束') {
+        return next.has(c) ? new Set() : new Set([c]);
+      }
+      next.delete('无约束');
+      next.has(c) ? next.delete(c) : next.add(c);
+      return next;
+    });
+  };
+
+  const toggleGenScope = (s: string) => {
+    setGenScopes(prev => {
+      const next = new Set(prev);
+      next.has(s) ? next.delete(s) : next.add(s);
+      return next;
+    });
+  };
+
+  const handlePolish = async (key: string, text: string, onResult: (polished: string) => void, minLength?: number) => {
+    if (!text.trim() || polishingKeys.has(key)) return;
+    setPolishingKeys((prev) => new Set(prev).add(key));
+    setPolishError(null);
+    try {
+      const result = await polishTextApi({ text });
+      const polished = result.polishedText;
+      if (minLength !== undefined && [...polished].length < minLength) {
+        setPolishError(`润色结果过短（${[...polished].length} 字），要求至少 ${minLength} 字，请重试`);
+        setTimeout(() => setPolishError(null), 5000);
+        return;
+      }
+      onResult(polished);
+    } catch (err) {
+      setPolishError(err instanceof Error ? err.message : '润色失败');
+      setTimeout(() => setPolishError(null), 4000);
+    } finally {
+      setPolishingKeys((prev) => {
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      });
+    }
+  };
+
+  const handleSaveRoundNotes = async (
+    roundId: string,
+    groupKey: string,
+    originalNotes: string,
+    originalNextPrompt: string,
+    originalNextPromptTaskType: string,
+  ) => {
+    if (savingRoundNotes.has(roundId)) return;
+    setSavingRoundNotes((prev) => new Set(prev).add(roundId));
+    try {
+      const notes = polishedNotes[roundId] ?? originalNotes;
+      const nextPrompt = nextRoundPromptDrafts[groupKey] ?? originalNextPrompt;
+      const nextPromptTaskType =
+        nextRoundTaskTypeDrafts[groupKey] ??
+        originalNextPromptTaskType ??
+        inferNextPromptTaskType(nextPrompt);
+      await saveAiReviewRoundNotes(roundId, notes, nextPrompt, nextPromptTaskType);
+      // After saving, clear polished state so it shows the saved version
+      setPolishedNotes((prev) => {
+        const next = { ...prev };
+        delete next[roundId];
+        return next;
+      });
+    } catch (err) {
+      setPolishError(err instanceof Error ? err.message : '保存失败');
+      setTimeout(() => setPolishError(null), 4000);
+    } finally {
+      setSavingRoundNotes((prev) => {
+        const next = new Set(prev);
+        next.delete(roundId);
+        return next;
+      });
+    }
+  };
+
+  const handleSaveDissatisfactionSummary = async (
+    roundId: string,
+    originalSummary: string,
+  ) => {
+    if (savingRoundSummaries.has(roundId)) return;
+    setSavingRoundSummaries((prev) => new Set(prev).add(roundId));
+    try {
+      const summary = polishedDissatisfactionSummaries[roundId] ?? originalSummary;
+      await saveAiReviewRoundDissatisfactionSummary(roundId, summary);
+      setPolishedDissatisfactionSummaries((prev) => ({ ...prev, [roundId]: summary }));
+    } catch (err) {
+      setPolishError(err instanceof Error ? err.message : '保存失败');
+      setTimeout(() => setPolishError(null), 4000);
+    } finally {
+      setSavingRoundSummaries((prev) => {
+        const next = new Set(prev);
+        next.delete(roundId);
+        return next;
+      });
+    }
+  };
+
+  const handleStartGenerate = () => {
+    if (!genTaskType || genScopes.size === 0) return;
+    void onGeneratePrompt({
+      providerId: genProviderId || null,
+      taskType: genTaskType,
+      scopes: [...genScopes],
+      constraints: genConstraints.size > 0 ? [...genConstraints] : ['无约束'],
+      additionalNotes: genNotes.trim() || null,
+      thinkingBudget: genThinking,
+    });
+    setShowRegenForm(false);
+    setSubmitToast(true);
+    setTimeout(() => setSubmitToast(false), 4000);
+  };
+
+  const [activeSessionLocalId, setActiveSessionLocalId] = useState<string | null>(null);
+
+  const getRemainingToCompleteValue = (taskType: string) => {
+    const normalizedTaskType = normalizeTaskTypeName(taskType);
+    if (!normalizedTaskType) {
+      return null;
+    }
+
+    return taskTypeRemainingToCompleteByType[normalizedTaskType] ?? null;
+  };
+
+  const formatRemainingToComplete = (
+    value: number | null,
+    mode: 'option' | 'inline',
+  ) => {
+    if (value === null) {
+      return mode === 'option' ? '' : '当前类型不限额';
+    }
+    return mode === 'option' ? ` · 待完成 ${value}` : `当前待完成 ${value}`;
+  };
+
+  useEffect(() => {
+    if (sessionListDraft.length === 0) {
+      setActiveSessionLocalId(null);
+      return;
+    }
+
+    const activeStillExists = activeSessionLocalId && sessionListDraft.some((session) => session.localId === activeSessionLocalId);
+    if (activeStillExists) {
+      return;
+    }
+
+    const reverseSessions = [...sessionListDraft].reverse();
+    const preferred =
+      reverseSessions.find((session) => openSessionEditors.has(session.localId) || !session.sessionId.trim())?.localId ??
+      sessionListDraft[0]?.localId ??
+      null;
+
+    setActiveSessionLocalId(preferred);
+  }, [activeSessionLocalId, openSessionEditors, sessionListDraft]);
+
+  const activeSessionIndex = useMemo(() => {
+    if (sessionListDraft.length === 0) {
+      return -1;
+    }
+    const matchedIndex = sessionListDraft.findIndex((session) => session.localId === activeSessionLocalId);
+    return matchedIndex >= 0 ? matchedIndex : 0;
+  }, [activeSessionLocalId, sessionListDraft]);
+
+  const activeSession = activeSessionIndex >= 0 ? sessionListDraft[activeSessionIndex] : null;
+  const sessionEvidence = activeSession?.evidence ?? null;
+  const activeSessionPresentation = activeSession ? getTaskTypePresentation(activeSession.taskType) : null;
+  const activeRemainingToComplete = activeSession
+    ? getRemainingToCompleteValue(activeSession.taskType)
+    : null;
+  const executionRuns = useMemo(
+    () => safeSelectedModelRuns.filter((run) => !isNonExecutionModel(run.modelName, sourceModelName)),
+    [safeSelectedModelRuns, sourceModelName],
+  );
+  const taskAiReviewJobs = useMemo<ParsedAiReviewJob[]>(
+    () =>
+      backgroundJobs
+        .filter((job) => job.jobType === 'ai_review' && job.taskId === selected.id)
+        .slice()
+        .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))
+        .map((job) => {
+          const input = parseAiReviewPayload(job.inputPayload);
+          const output = parseAiReviewResult(job.outputPayload);
+          const details =
+            extractAiReviewDetailsFromResult(output) ??
+            parseAiReviewProgressDetails(job.progressMessage);
+          const modelRunId = trimToNull(output?.modelRunId) ?? trimToNull(input?.modelRunId);
+          const localPath = trimToNull(input?.localPath);
+          return {
+            job,
+            input,
+            output,
+            modelRunId,
+            localPath,
+            displayName:
+              trimToNull(output?.modelName) ??
+              trimToNull(input?.modelName) ??
+              basenameOrFallback(localPath, job.id),
+            details,
+          };
+        }),
+    [backgroundJobs, selected.id],
+  );
+  const latestAiReviewJobByKey = useMemo(() => {
+    const map = new Map<string, ParsedAiReviewJob>();
+    taskAiReviewJobs.forEach((entry) => {
+      const key = buildAiReviewKey(entry.modelRunId, entry.localPath);
+      if (key && !map.has(key)) {
+        map.set(key, entry);
+      }
+    });
+    return map;
+  }, [taskAiReviewJobs]);
+  const latestAiReviewJobByRoundId = useMemo(() => {
+    const map = new Map<string, ParsedAiReviewJob>();
+    taskAiReviewJobs.forEach((entry) => {
+      const roundId = trimToNull(entry.output?.reviewRoundId) ?? trimToNull(entry.input?.reviewRoundId);
+      if (roundId && !map.has(roundId)) {
+        map.set(roundId, entry);
+      }
+    });
+    return map;
+  }, [taskAiReviewJobs]);
+  const aiReviewStatusEntries = useMemo<AiReviewStatusEntry[]>(() => {
+    const entries: AiReviewStatusEntry[] = [];
+    const seenRunIds = new Set<string>();
+    const seenPaths = new Set<string>();
+
+    safeSelectedModelRuns.forEach((run) => {
+      const normalizedRunId = trimToNull(run.id);
+      const normalizedPath = trimToNull(run.localPath);
+      if (!normalizedPath && run.reviewStatus === 'none') {
+        return;
+      }
+
+      const latestJob =
+        latestAiReviewJobByKey.get(buildAiReviewKey(run.id, run.localPath) ?? '') ??
+        latestAiReviewJobByKey.get(buildAiReviewKey(null, run.localPath) ?? '') ??
+        null;
+      const latestOutput = latestJob?.output ?? null;
+      entries.push({
+        key: normalizedRunId ?? normalizedPath ?? `run:${run.modelName}`,
+        modelRunId: normalizedRunId,
+        displayName: formatModelRunDisplayLabel(
+          run.modelName,
+          run.localPath,
+          sourceModelName,
+        ),
+        localPath: normalizedPath,
+        reviewStatus: run.reviewStatus,
+        reviewRound: run.reviewRound,
+        reviewNotes:
+          meaningfulAiReviewText(latestOutput?.reviewNotes) ??
+          meaningfulAiReviewText(run.reviewNotes),
+        nextPrompt: meaningfulAiReviewText(latestOutput?.nextPrompt),
+        latestJob,
+        isUnlinked: false,
+        details: latestJob?.details ?? null,
+      });
+      if (normalizedRunId) {
+        seenRunIds.add(normalizedRunId);
+      }
+      if (normalizedPath) {
+        seenPaths.add(normalizedPath);
+      }
+    });
+
+    latestAiReviewJobByKey.forEach((jobEntry, key) => {
+      const normalizedRunId = trimToNull(jobEntry.modelRunId);
+      const normalizedPath = trimToNull(jobEntry.localPath);
+      if ((normalizedRunId && seenRunIds.has(normalizedRunId)) || (normalizedPath && seenPaths.has(normalizedPath))) {
+        return;
+      }
+
+      entries.push({
+        key,
+        modelRunId: normalizedRunId,
+        displayName: jobEntry.displayName,
+        localPath: normalizedPath,
+        reviewStatus: deriveReviewStatusFromJob(jobEntry),
+        reviewRound: jobEntry.output?.reviewRound ?? 0,
+        reviewNotes:
+          meaningfulAiReviewText(jobEntry.output?.reviewNotes) ??
+          trimToNull(jobEntry.job.errorMessage),
+        nextPrompt: meaningfulAiReviewText(jobEntry.output?.nextPrompt),
+        latestJob: jobEntry,
+        isUnlinked: !normalizedRunId,
+        details: jobEntry.details,
+      });
+    });
+
+    return entries;
+  }, [latestAiReviewJobByKey, safeSelectedModelRuns, sourceModelName]);
+  const hasTaskReadme = !!selectedTaskReadme?.content.trim();
+  const availableTabItems = useMemo(
+    () =>
+      TAB_ITEMS.filter((tab) => {
+        if (!aiReviewVisible && !selectedTaskDetail?.projectConfigId && tab.id === 'ai-review') {
+          return false;
+        }
+        if (!hasTaskReadme && tab.id === 'readme') {
+          return false;
+        }
+        return true;
+      }),
+    [aiReviewVisible, hasTaskReadme, selectedTaskDetail?.projectConfigId],
+  );
+  const effectiveActiveDrawerTab =
+    !aiReviewVisible && !selectedTaskDetail?.projectConfigId && activeDrawerTab === 'ai-review'
+      ? 'model-runs'
+      : !hasTaskReadme && activeDrawerTab === 'readme'
+        ? (selected.status === 'Submitted' || selected.status === 'ExecutionCompleted'
+            ? 'sessions'
+            : 'prompt')
+      : activeDrawerTab;
+  const createdAtText = new Date(selected.createdAt * 1000).toLocaleString('zh-CN');
+
+  const handleTabSwitch = (tab: TaskDetailDrawerTab) => {
+    if (!aiReviewVisible && tab === 'ai-review') {
+      return;
+    }
+    if (tab === effectiveActiveDrawerTab) {
+      return;
+    }
+    if (effectiveActiveDrawerTab === 'sessions' && activeSessionLocalId) {
+      void onSessionEditorBlur(activeSessionLocalId);
+    }
+    onTabChange(tab);
+  };
+
+  const handleSelectSession = (localId: string) => {
+    if (localId === activeSessionLocalId) {
+      return;
+    }
+    if (activeSessionLocalId) {
+      void onSessionEditorBlur(activeSessionLocalId);
+    }
+    onToggleSessionEditor(localId);
+    setActiveSessionLocalId(localId);
+  };
+
+  const handleDeleteAiReviewRecord = async (entry: ParsedAiReviewJob) => {
+    if (!onDeleteAiReviewRecord) {
+      return;
+    }
+
+    const label = entry.displayName || '当前记录';
+    if (!window.confirm(`确定删除“${label}”的这条复审记录吗？`)) {
+      return;
+    }
+
+    setDeleteAiReviewError('');
+    setDeletingAiReviewJobId(entry.job.id);
+    try {
+      await onDeleteAiReviewRecord(entry.job.id);
+    } catch (error) {
+      setDeleteAiReviewError(error instanceof Error ? error.message : '删除复审记录失败');
+    } finally {
+      setDeletingAiReviewJobId((current) => (current === entry.job.id ? null : current));
+    }
+  };
+
+  const handleResetAiReviewRound = async (roundId: string, roundLabel: string) => {
+    if (!onResetAiReviewRound) {
+      return;
+    }
+
+    if (!window.confirm(`确定重置“${roundLabel}”吗？这会从数据库清除本轮复审结果。`)) {
+      return;
+    }
+
+    setDeleteAiReviewError('');
+    setResettingAiReviewRoundId(roundId);
+    try {
+      await onResetAiReviewRound(roundId);
+    } catch (error) {
+      setDeleteAiReviewError(error instanceof Error ? error.message : '重置复审轮次失败');
+    } finally {
+      setResettingAiReviewRoundId((current) => (current === roundId ? null : current));
+    }
+  };
+
+  useEffect(() => {
+    const sessionId = activeSession?.sessionId?.trim() ?? '';
+    if (activeDrawerTab !== 'sessions' || !activeSession || !sessionId) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const meta = event.metaKey || event.ctrlKey;
+      if (!meta || !event.shiftKey || event.key.toLowerCase() !== 'c') {
+        return;
+      }
+      if (isEditableTarget(event.target)) {
+        return;
+      }
+
+      event.preventDefault();
+      void onCopySessionId(activeSession.localId, sessionId);
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [
+    activeDrawerTab,
+    activeSession,
+    onCopySessionId,
+  ]);
+
+  useEffect(() => {
+    if (!hasTaskReadme && activeDrawerTab === 'readme') {
+      onTabChange(
+        selected.status === 'Submitted' || selected.status === 'ExecutionCompleted'
+          ? 'sessions'
+          : 'prompt',
+      );
+    }
+  }, [activeDrawerTab, hasTaskReadme, onTabChange, selected.status]);
+
+  const renderSessionsWorkspace = () => {
+    if (!activeSession || !activeSessionPresentation) {
+      return (
+        <div className="flex h-full items-center justify-center px-6 text-sm text-zinc-500">
+          当前没有可编辑的 session
+        </div>
+      );
+    }
+
+    const isCounted = isSessionCounted(activeSession, activeSessionIndex);
+    const isQuotaToggleOn = activeSessionIndex === 0 ? true : activeSession.consumeQuota;
+    const requiresSessionId = !activeSession.sessionId.trim();
+    const isPendingCount = activeSessionIndex > 0 && isQuotaToggleOn && requiresSessionId;
+    const isCompleted = getSessionDecisionValue(activeSession.isCompleted);
+    const isSatisfied = getSessionDecisionValue(activeSession.isSatisfied);
+    const autoExtractLabel =
+      sessionModelOptions.length > 1 ? '提取当前模型 session' : '自动提取 session';
+    const quotaHint =
+      activeSessionIndex === 0
+        ? '首个 session 固定扣减'
+        : requiresSessionId
+          ? (isQuotaToggleOn ? '填写 sessionId 后才会生效' : '填写 sessionId 后可开启计数')
+          : formatRemainingToComplete(activeRemainingToComplete, 'inline');
+
+    return (
+      <div className="flex h-full min-h-0 flex-col md:flex-row">
+        <aside className="flex w-full shrink-0 flex-col border-b border-stone-200 bg-white md:w-[260px] lg:w-[320px] md:border-b-0 md:border-r dark:border-zinc-800/70 dark:bg-[#0c0c0f]">
+          <div className="border-b border-stone-200 px-4 py-3 dark:border-zinc-800/70">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-stone-500 dark:text-zinc-500">Session 列表</p>
+                <p className="mt-1 text-xs text-stone-600 dark:text-zinc-400">{summarizeCountedRounds(sessionListDraft)}</p>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  aria-label={autoExtractLabel}
+                  title={autoExtractLabel}
+                  onClick={() => void onAutoExtractSessions()}
+                  disabled={sessionExtracting || drawerLoading || taskTypeChanging}
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-sky-500/20 bg-sky-500/10 text-sky-200 transition hover:bg-sky-500/15 disabled:opacity-60"
+                >
+                  <RefreshCw
+                    className={clsx('h-3.5 w-3.5', sessionExtracting && 'animate-spin')}
+                  />
+                </button>
+                <button
+                  type="button"
+                  onClick={onAddSession}
+                  disabled={sessionExtracting}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2.5 py-1.5 text-[11px] font-medium text-stone-700 transition hover:border-stone-300 hover:bg-stone-50 disabled:opacity-60 dark:border-zinc-700/70 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:border-zinc-600 dark:hover:bg-zinc-800"
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  新增
+                </button>
+                {onCompleteCurrentSessionAndAdd && (
+                  <button
+                    type="button"
+                    onClick={() => void onCompleteCurrentSessionAndAdd()}
+                    disabled={sessionExtracting || sessionListSaving}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-2.5 py-1.5 text-[11px] font-medium text-emerald-200 transition hover:bg-emerald-500/15 disabled:opacity-60"
+                    title="检查当前轮代码提交后再新增下一轮"
+                  >
+                    <CheckCircle2 className="h-3.5 w-3.5" />
+                    完成
+                  </button>
+                )}
+              </div>
+            </div>
+            {sessionModelOptions.length > 0 && (
+              <div className="mt-3 space-y-2">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-stone-500 dark:text-zinc-500">当前模型</p>
+                {sessionModelOptions.length > 1 ? (
+                  <div className="relative">
+                    <select
+                      value={selectedSessionModelName}
+                      onChange={(event) => onSessionModelChange(event.target.value)}
+                      className="w-full appearance-none rounded-xl border border-zinc-800 bg-black/30 px-3 py-2.5 pr-9 text-sm font-medium text-zinc-200 outline-none transition focus:border-indigo-500/60 focus:ring-1 focus:ring-indigo-500/40"
+                    >
+                      {sessionModelOptions.map((option) => (
+                        <option key={option.modelName} value={option.modelName}>
+                          {option.modelName}
+                        </option>
+                      ))}
+                    </select>
+                    <ChevronRight className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 rotate-90 text-zinc-500" />
+                  </div>
+                ) : (
+                  <div className="rounded-xl border border-zinc-800 bg-black/30 px-3 py-2.5 text-sm font-medium text-zinc-200">
+                    {sessionModelOptions[0]?.modelName}
+                  </div>
+                )}
+                {sessionModelOptions.find((option) => option.modelName === selectedSessionModelName)?.localPath && (
+                  <p className="break-all text-[11px] leading-5 text-zinc-500">
+                    {sessionModelOptions.find((option) => option.modelName === selectedSessionModelName)?.localPath}
+                  </p>
+                )}
+              </div>
+            )}
+            <div className="mt-3 flex items-center gap-2 text-[11px]">
+              <WorkspaceBadge tone={sessionListSaving ? 'warning' : hasUnsavedSessionChanges ? 'warning' : sessionSaveState === 'saved' ? 'success' : 'neutral'}>
+                {sessionListSaving ? '保存中…' : hasUnsavedSessionChanges ? '待保存' : sessionSaveState === 'saved' ? '已保存' : '已同步'}
+              </WorkspaceBadge>
+              <WorkspaceBadge tone="neutral">共 {sessionListDraft.length || 1} 轮</WorkspaceBadge>
+            </div>
+          </div>
+
+          <div className="min-h-0 flex-1 space-y-2 overflow-y-auto px-3 py-3">
+            {sessionListDraft.map((session, index) => {
+              const counted = isSessionCounted(session, index);
+              const pendingCount = index > 0 && session.consumeQuota && !session.sessionId.trim();
+              const selectedCard = session.localId === activeSession.localId;
+              const sessionCompleted = getSessionDecisionValue(session.isCompleted);
+              const sessionSatisfied = getSessionDecisionValue(session.isSatisfied);
+              const preview = session.userConversation?.trim() || session.evaluation?.trim() || '当前没有补充内容';
+
+              return (
+                <div
+                  key={session.localId}
+                  className={clsx(
+                    'w-full rounded-2xl border p-3 text-left transition',
+                    selectedCard
+                      ? 'border-indigo-500/35 bg-indigo-500/10 shadow-[0_0_24px_rgba(99,102,241,0.12)]'
+                      : 'border-transparent bg-stone-100 hover:border-stone-200 hover:bg-stone-200/50 dark:bg-zinc-900/35 dark:hover:border-zinc-700/70 dark:hover:bg-zinc-800/40',
+                  )}
+                >
+                  {/* 卡片头部：点击选中 */}
+                  <button
+                    type="button"
+                    onClick={() => handleSelectSession(session.localId)}
+                    className="w-full text-left"
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className={clsx('text-xs font-semibold', selectedCard ? 'text-indigo-200' : 'text-stone-700 dark:text-zinc-200')}>
+                            第 {index + 1} 轮
+                          </span>
+                          {index === 0 && <WorkspaceBadge tone="neutral">主 session</WorkspaceBadge>}
+                          <WorkspaceBadge tone={index === 0 || counted ? 'success' : pendingCount ? 'warning' : 'neutral'}>
+                            {index === 0 ? '固定计数' : counted ? '计数' : pendingCount ? '待计数' : '不计数'}
+                          </WorkspaceBadge>
+                        </div>
+                        <p className="mt-2 line-clamp-2 text-[11px] leading-5 text-stone-500 dark:text-zinc-500">{preview}</p>
+                      </div>
+                    </div>
+                  </button>
+
+                  {/* 任务类型 + 扣任务数开关 */}
+                  <div className="mt-2.5 flex items-center gap-2">
+                    {/* 任务类型下拉 */}
+                    <TaskTypeSelect
+                      value={session.taskType}
+                      disabled={taskTypeChanging || index === 0}
+                      selected={selectedCard}
+                      options={sessionTaskTypeOptions.map((t) => {
+                        const p = getTaskTypePresentation(t);
+                        return { value: p.value, label: p.label };
+                      })}
+                      onChange={(val) => onSessionChange(session.localId, { taskType: val })}
+                      onClick={(e) => e.stopPropagation()}
+                    />
+
+                    {/* 扣任务数开关 */}
+                    <div className="group relative flex items-center gap-1.5 shrink-0">
+                      {/* 帮助按钮 - 移到左侧 */}
+                      <Tooltip content={index === 0 ? '首个 session 固定扣减任务数，无法更改' : '开启后将扣减对应任务类型的配额，关闭则不扣减'}>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                          }}
+                          className="flex h-5 w-5 items-center justify-center rounded-md text-stone-400 opacity-0 transition hover:bg-stone-100 hover:text-stone-600 group-hover:opacity-100 dark:text-zinc-600 dark:hover:bg-zinc-800 dark:hover:text-zinc-400"
+                        >
+                          <HelpCircle className="h-3.5 w-3.5" />
+                        </button>
+                      </Tooltip>
+                      <button
+                        type="button"
+                        disabled={index === 0}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (index > 0) {
+                            onSessionChange(session.localId, { consumeQuota: !session.consumeQuota });
+                          }
+                        }}
+                        className={clsx(
+                          'flex h-6 items-center gap-1.5 rounded-md border px-2.5 text-[10px] font-medium transition',
+                          index === 0
+                            ? 'cursor-default border-indigo-500/30 bg-indigo-500/10 text-indigo-400 opacity-70'
+                            : session.consumeQuota
+                              ? 'border-indigo-500/50 bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30'
+                              : 'border-stone-200 bg-stone-50 text-stone-500 hover:border-stone-300 hover:text-stone-700 dark:border-zinc-700/70 dark:bg-zinc-900/80 dark:text-zinc-500 dark:hover:border-zinc-600 dark:hover:text-zinc-400',
+                        )}
+                      >
+                        <div className={clsx('h-2 w-2 rounded-full', session.consumeQuota || index === 0 ? 'bg-current' : 'bg-stone-300 dark:bg-zinc-600')} />
+                        {index === 0 ? '固定' : session.consumeQuota ? '计数' : '不计'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="border-t border-stone-200 px-4 py-3 dark:border-zinc-800/70">
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={onResetSessions}
+                disabled={sessionListSaving}
+                className="flex-1 rounded-xl border border-stone-200 bg-white px-3 py-2 text-xs font-medium text-stone-700 transition hover:border-stone-300 hover:bg-stone-50 disabled:opacity-50 dark:border-zinc-700/70 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:border-zinc-600 dark:hover:bg-zinc-800"
+              >
+                还原
+              </button>
+              <button
+                type="button"
+                onClick={() => void onSaveSessionList()}
+                disabled={sessionListSaving || sessionListDraft.length === 0 || !hasUnsavedSessionChanges}
+                className="flex-1 rounded-xl bg-indigo-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-indigo-500 disabled:opacity-50"
+              >
+                {sessionListSaving ? '保存中…' : '保存列表'}
+              </button>
+            </div>
+          </div>
+        </aside>
+
+        <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            <motion.div
+              key={activeSession.localId}
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.18 }}
+              className="mx-auto max-w-5xl space-y-6 px-4 py-5 pb-28 sm:px-6 lg:px-8"
+            >
+              <section className="flex flex-col gap-4 border-b border-stone-200 pb-4 lg:flex-row lg:items-start lg:justify-between dark:border-zinc-800/60">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h3 className="text-lg font-semibold text-stone-900 dark:text-white">第 {activeSessionIndex + 1} 轮详情</h3>
+                    {selectedSessionModelName && <WorkspaceBadge tone="blue">{selectedSessionModelName}</WorkspaceBadge>}
+                    {activeSessionIndex === 0 && <WorkspaceBadge tone="neutral">主 session</WorkspaceBadge>}
+                    <WorkspaceBadge tone={isCounted ? 'success' : isPendingCount ? 'warning' : 'neutral'}>
+                      {activeSessionIndex === 0 ? '固定计数' : isCounted ? '计数中' : isPendingCount ? '待计数' : '不计数'}
+                    </WorkspaceBadge>
+                    <span className="inline-flex items-center gap-1 rounded-full border border-stone-200 bg-stone-100 px-2 py-0.5 text-[10px] font-medium text-stone-700 dark:border-zinc-700/70 dark:bg-zinc-900 dark:text-zinc-300">
+                      <span className={clsx('h-1.5 w-1.5 rounded-full', activeSessionPresentation.dot)} />
+                      {activeSessionPresentation.label}
+                    </span>
+                  </div>
+                  <p className="mt-2 text-sm leading-6 text-stone-600 dark:text-zinc-400">
+                    {activeSession.userConversation?.trim() || '这一轮还没有补充用户对话信息，可以直接在下面编辑。'}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  {activeSessionIndex > 0 && (
+                    <ActionIconButton
+                      label="删除 session"
+                      danger
+                      onClick={() => onRemoveSession(activeSession.localId)}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </ActionIconButton>
+                  )}
+                </div>
+              </section>
+
+              <SectionBlock
+                icon={Hash}
+                title="会话标识"
+                description="保留原始 sessionId，同时允许直接修正记录值。"
+              >
+                <div className="grid gap-3 lg:grid-cols-2">
+                  {/* 用户对话 */}
+                  <div
+                    className="group rounded-2xl border border-stone-200 bg-white/60 px-4 py-3 dark:border-zinc-800/70 dark:bg-zinc-900/40"
+                    onDoubleClick={() => {
+                      if (conversationEditMode !== activeSession.localId) {
+                        setConversationEditMode(activeSession.localId);
+                      }
+                    }}
+                    title={conversationEditMode === activeSession.localId ? undefined : '双击编辑用户对话'}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0 flex-1">
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-stone-500 dark:text-zinc-500">
+                          用户对话
+                        </p>
+                        {conversationEditMode === activeSession.localId ? (
+                          <textarea
+                            autoFocus
+                            value={activeSession.userConversation ?? ''}
+                            onChange={(e) => onSessionChange(activeSession.localId, { userConversation: e.target.value })}
+                            onBlur={() => setConversationEditMode(null)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Escape') setConversationEditMode(null);
+                            }}
+                            rows={5}
+                            className="mt-2 w-full resize-none rounded-xl border border-indigo-500/40 bg-black/30 px-2 py-1.5 text-xs leading-6 text-stone-900 outline-none focus:ring-1 focus:ring-indigo-500/40 dark:text-zinc-200"
+                          />
+                        ) : (
+                          <div className="mt-2 line-clamp-6 cursor-text text-xs leading-6 text-stone-800 dark:text-zinc-200">
+                            {activeSession.userConversation?.trim() || (
+                              <span className="text-stone-400 dark:text-zinc-600">双击添加用户对话…</span>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                      {activeSession.userConversation?.trim() && conversationEditMode !== activeSession.localId && (
+                        <ActionIconButton
+                          label={copiedConversation === activeSession.localId ? '已复制' : '复制用户对话'}
+                          onClick={() => {
+                            void writeClipboardText(activeSession.userConversation ?? '').then(() => {
+                              setCopiedConversation(activeSession.localId);
+                              setTimeout(() => setCopiedConversation(null), 2000);
+                            });
+                          }}
+                        >
+                          {copiedConversation === activeSession.localId ? (
+                            <Check className="h-4 w-4" />
+                          ) : (
+                            <Copy className="h-4 w-4" />
+                          )}
+                        </ActionIconButton>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* SessionID - 双击编辑 */}
+                  <div
+                    className="group rounded-2xl border border-stone-200 bg-white/60 px-4 py-3 dark:border-zinc-800/70 dark:bg-zinc-900/40"
+                    onDoubleClick={() => {
+                      if (sessionIdEditMode !== activeSession.localId) {
+                        setSessionIdEditMode(activeSession.localId);
+                      }
+                    }}
+                    title={sessionIdEditMode === activeSession.localId ? undefined : '双击编辑 Session ID'}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0 flex-1">
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-stone-500 dark:text-zinc-500">
+                          Session ID
+                        </p>
+                        {sessionIdEditMode === activeSession.localId ? (
+                          <input
+                            autoFocus
+                            value={activeSession.sessionId}
+                            onChange={(e) => onSessionChange(activeSession.localId, { sessionId: e.target.value })}
+                            onBlur={() => setSessionIdEditMode(null)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Escape' || e.key === 'Enter') setSessionIdEditMode(null);
+                            }}
+                            className="mt-2 w-full rounded-xl border border-indigo-500/40 bg-black/30 px-2 py-1.5 font-mono text-xs text-stone-900 outline-none focus:ring-1 focus:ring-indigo-500/40 dark:text-zinc-200"
+                            placeholder="输入 Session ID"
+                          />
+                        ) : (
+                          <div className="mt-2 break-words cursor-text font-mono text-xs text-stone-800 dark:text-zinc-200">
+                            {activeSession.sessionId?.trim() || (
+                              <span className="text-stone-400 dark:text-zinc-600">双击添加 Session ID…</span>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                      {activeSession.sessionId?.trim() && sessionIdEditMode !== activeSession.localId && (
+                        <ActionIconButton
+                          label={copiedDetailSessionId === activeSession.localId ? '已复制' : '复制 Session ID'}
+                          onClick={() => {
+                            void writeClipboardText(activeSession.sessionId ?? '').then(() => {
+                              setCopiedDetailSessionId(activeSession.localId);
+                              setTimeout(() => setCopiedDetailSessionId(null), 2000);
+                            });
+                          }}
+                        >
+                          {copiedDetailSessionId === activeSession.localId ? (
+                            <Check className="h-4 w-4" />
+                          ) : (
+                            <Copy className="h-4 w-4" />
+                          )}
+                        </ActionIconButton>
+                      )}
+                    </div>
+                  </div>
+                </div>
+                {sessionEvidence && (
+                  <div className="mt-4 rounded-2xl border border-sky-500/20 bg-sky-500/5 px-4 py-4">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-[11px] font-medium text-stone-600 dark:text-zinc-500">Session 依据</span>
+                      <WorkspaceBadge tone="blue">
+                        {matchKindLabel(sessionEvidence.matchKind)}
+                      </WorkspaceBadge>
+                      {sessionEvidence.isCurrent && (
+                        <WorkspaceBadge tone="success">当前会话</WorkspaceBadge>
+                      )}
+                    </div>
+                    <div className="mt-3 grid gap-3 lg:grid-cols-2">
+                      <InfoTile label="用户">
+                        {sessionEvidence.username || sessionEvidence.userId || '未记录'}
+                      </InfoTile>
+                      <InfoTile label="最近活动">
+                        {sessionEvidence.lastActivityAt
+                          ? new Date(sessionEvidence.lastActivityAt * 1000).toLocaleString('zh-CN')
+                          : '未记录'}
+                      </InfoTile>
+                      <InfoTile label="提取时间">
+                        {sessionEvidence.extractedAt
+                          ? new Date(sessionEvidence.extractedAt * 1000).toLocaleString('zh-CN')
+                          : '未记录'}
+                      </InfoTile>
+                      <InfoTile label="匹配目录">
+                        {sessionEvidence.matchedPath || '未记录'}
+                      </InfoTile>
+                    </div>
+                    <div className="mt-3 space-y-2 text-xs leading-6 text-zinc-400">
+                      <p className="break-all">
+                        工作区目录：{sessionEvidence.workspacePath || '未记录'}
+                      </p>
+                      {sessionEvidence.summary && (
+                        <p>{sessionEvidence.summary}</p>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </SectionBlock>
+            </motion.div>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderPromptGenerationForm = () => (
+    <div className="space-y-5">
+      {selectedPromptGenerationStatus === 'error' && selectedPromptGenerationError && (
+        <StatusBanner tone="danger">上次生成失败：{selectedPromptGenerationError}</StatusBanner>
+      )}
+      {promptLlmProviders.length === 0 && (
+        <StatusBanner tone="warning">请先在设置中配置 DeepSeek V4 Flash 提供商。</StatusBanner>
+      )}
+
+      {/* 任务类型 - pill 选择器 */}
+      <fieldset className="space-y-2">
+        <legend className="text-[11px] font-semibold uppercase tracking-[0.18em] text-zinc-500">任务类型</legend>
+        <div className="flex flex-wrap gap-1.5">
+          {sessionTaskTypeOptions.map(t => (
+            <button
+              key={t}
+              type="button"
+              onClick={() => setGenTaskType(t)}
+              className={clsx(
+                'rounded-full border px-3.5 py-1.5 text-xs font-medium transition-all duration-150',
+                genTaskType === t
+                  ? 'border-indigo-500/60 bg-indigo-500/15 text-indigo-300 shadow-[0_0_12px_rgba(99,102,241,0.15)]'
+                  : 'border-stone-200 bg-stone-100 text-stone-600 hover:border-stone-300 hover:text-stone-700 dark:border-zinc-700/60 dark:bg-zinc-900/80 dark:text-zinc-400 dark:hover:border-zinc-600 dark:hover:text-zinc-300',
+              )}
+            >
+              {t}
+            </button>
+          ))}
+        </div>
+      </fieldset>
+
+      {/* 约束类型 */}
+      <fieldset className="space-y-2">
+        <legend className="text-[11px] font-semibold uppercase tracking-[0.18em] text-zinc-500">约束类型</legend>
+        <div className="flex flex-wrap gap-1.5">
+          {CONSTRAINT_OPTIONS.map(c => (
+            <button
+              key={c}
+              type="button"
+              onClick={() => toggleGenConstraint(c)}
+              className={clsx(
+                'rounded-full border px-3.5 py-1.5 text-xs font-medium transition-all duration-150',
+                genConstraints.has(c)
+                  ? 'border-indigo-500/60 bg-indigo-500/15 text-indigo-300 shadow-[0_0_12px_rgba(99,102,241,0.15)]'
+                  : 'border-stone-200 bg-stone-100 text-stone-600 hover:border-stone-300 hover:text-stone-700 dark:border-zinc-700/60 dark:bg-zinc-900/80 dark:text-zinc-400 dark:hover:border-zinc-600 dark:hover:text-zinc-300',
+              )}
+            >
+              {c}
+            </button>
+          ))}
+        </div>
+      </fieldset>
+
+      {/* 修改范围 */}
+      <fieldset className="space-y-2">
+        <legend className="text-[11px] font-semibold uppercase tracking-[0.18em] text-zinc-500">修改范围</legend>
+        <div className="flex flex-wrap gap-1.5">
+          {SCOPE_OPTIONS.map(s => (
+            <button
+              key={s}
+              type="button"
+              onClick={() => toggleGenScope(s)}
+              className={clsx(
+                'rounded-full border px-3.5 py-1.5 text-xs font-medium transition-all duration-150',
+                genScopes.has(s)
+                  ? 'border-indigo-500/60 bg-indigo-500/15 text-indigo-300 shadow-[0_0_12px_rgba(99,102,241,0.15)]'
+                  : 'border-stone-200 bg-stone-100 text-stone-600 hover:border-stone-300 hover:text-stone-700 dark:border-zinc-700/60 dark:bg-zinc-900/80 dark:text-zinc-400 dark:hover:border-zinc-600 dark:hover:text-zinc-300',
+              )}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+      </fieldset>
+
+      {/* 高级选项 - 可折叠 */}
+      <div className="rounded-2xl border border-zinc-800/50 bg-zinc-900/30">
+        <button
+          type="button"
+          onClick={() => setAdvancedOpen(prev => !prev)}
+          className="flex w-full items-center justify-between px-4 py-3 text-xs font-medium text-zinc-400 transition hover:text-zinc-300"
+        >
+          <span className="flex items-center gap-2">
+            <Settings2 className="h-3.5 w-3.5" />
+            高级选项
+          </span>
+          <ChevronDown className={clsx('h-3.5 w-3.5 transition-transform duration-200', advancedOpen && 'rotate-180')} />
+        </button>
+        <AnimatePresence initial={false}>
+          {advancedOpen && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
+              className="overflow-hidden"
+            >
+              <div className="space-y-4 border-t border-zinc-800/50 px-4 py-4">
+                <div className="grid gap-4 md:grid-cols-2">
+                  <label className="block space-y-1.5">
+                    <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-zinc-500">LLM 提供商</span>
+                    <select
+                      value={genProviderId}
+                      onChange={(e) => setGenProviderId(e.target.value)}
+                      className="w-full rounded-xl border border-stone-200 bg-white px-3 py-2 text-sm text-stone-800 outline-none focus:border-indigo-500/60 dark:border-zinc-700/70 dark:bg-zinc-900 dark:text-zinc-200"
+                    >
+                      {promptLlmProviders.map(p => (
+                        <option key={p.id} value={p.id}>
+                          {p.name} ({p.model}){p.isDefault ? ' · 默认' : ''}
+                        </option>
+                      ))}
+                      {promptLlmProviders.length === 0 && <option value="">请先在设置中配置</option>}
+                    </select>
+                  </label>
+
+                  <label className="block space-y-1.5">
+                    <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-zinc-500">思考深度</span>
+                    <select
+                      value={genThinking}
+                      onChange={(e) => setGenThinking(e.target.value)}
+                      className="w-full rounded-xl border border-stone-200 bg-white px-3 py-2 text-sm text-stone-800 outline-none focus:border-indigo-500/60 dark:border-zinc-700/70 dark:bg-zinc-900 dark:text-zinc-200"
+                    >
+                      {THINKING_OPTIONS.map(opt => (
+                        <option key={opt.value} value={opt.value}>{opt.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+
+                <label className="block space-y-1.5">
+                  <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-zinc-500">附加说明</span>
+                  <textarea
+                    value={genNotes}
+                    onChange={(e) => setGenNotes(e.target.value)}
+                    rows={2}
+                    placeholder="对出题方向的补充描述…"
+                    className="w-full rounded-xl border border-stone-200 bg-white px-3 py-2 text-sm text-stone-800 outline-none placeholder:text-stone-400 focus:border-indigo-500/60 dark:border-zinc-700/70 dark:bg-zinc-900 dark:text-zinc-200 dark:placeholder:text-zinc-600"
+                  />
+                </label>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+
+      {/* 提交按钮 */}
+      <button
+        type="button"
+        onClick={handleStartGenerate}
+        disabled={promptGenerating || !genTaskType || genScopes.size === 0 || promptLlmProviders.length === 0}
+        className="w-full rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-indigo-500 disabled:opacity-50"
+      >
+        {promptGenerating ? '正在生成…' : '开始出题'}
+      </button>
+    </div>
+  );
+
+  const renderReadmeWorkspace = () => {
+    if (!hasTaskReadme || !selectedTaskReadme) {
+      return (
+        <div className="flex h-full items-center justify-center px-6 text-sm text-zinc-500">
+          当前题目没有 README
+        </div>
+      );
+    }
+
+    return (
+      <div className="h-full overflow-y-auto px-4 py-5 sm:px-6 lg:px-8">
+        <div className="mx-auto max-w-3xl space-y-4 pb-6">
+          <div className="rounded-3xl border border-stone-200 bg-white px-5 py-5 dark:border-zinc-800/70 dark:bg-[#0c0c0f]">
+            <div className="mb-4">
+              <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-stone-500 dark:text-zinc-500">
+                README
+              </p>
+              <p className="mt-1 break-all text-xs text-stone-500 dark:text-zinc-400">
+                {selectedTaskReadme.path}
+              </p>
+            </div>
+            <MarkdownPreview
+              content={selectedTaskReadme.content}
+              emptyMessage="README 内容为空"
+            />
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const hasPromptText = !!(selectedTaskDetail?.promptText || promptDraft.trim());
+
+  const renderPromptWorkspace = () => (
+    <div className="h-full overflow-y-auto px-4 py-5 sm:px-6 lg:px-8">
+      <div className="mx-auto max-w-3xl space-y-6 pb-6">
+
+        {/* Toast 提示 */}
+        <AnimatePresence>
+          {submitToast && (
+            <motion.div
+              initial={{ opacity: 0, y: -12 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -12 }}
+              transition={{ duration: 0.2 }}
+              className="flex items-center gap-2.5 rounded-2xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3"
+            >
+              <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-400" />
+              <span className="text-sm text-emerald-300">已提交后台生成，可关闭面板继续其他操作</span>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* 正在生成中 */}
+        {promptGenerating && (
+          <div className="flex items-center gap-3 rounded-2xl border border-amber-500/30 bg-amber-500/5 px-4 py-4">
+            <RefreshCw className="h-4 w-4 animate-spin text-amber-400" />
+            <div>
+              <span className="text-sm text-amber-300">正在后台生成提示词…</span>
+              <span className="ml-2 text-xs text-amber-300/60">可关闭面板，完成后自动写入</span>
+            </div>
+          </div>
+        )}
+
+        {/* 状态 A: 无提示词 - 显示出题配置 */}
+        {!hasPromptText && !promptGenerating && (
+          <SectionBlock
+            icon={Wand2}
+            title="出题配置"
+            description="选择参数后一键生成评测提示词"
+          >
+            {renderPromptGenerationForm()}
+          </SectionBlock>
+        )}
+
+        {/* 状态 B: 有提示词 - 显示编辑区 + 重新生成 */}
+        {hasPromptText && (
+          <>
+            <SectionBlock
+              icon={Terminal}
+              title="提示词"
+              description="最终可提交的提示词内容，支持手动修订和回写"
+              badge={
+                <div className="flex items-center gap-2">
+                  <PromptDifficultyBadge difficulty={selectedTaskDetail?.promptDifficulty ?? selected.promptDifficulty} />
+                  <WorkspaceBadge tone={promptSaveState === 'saved' ? 'success' : 'neutral'}>
+                    {promptSaveState === 'saved' ? '已保存' : '未保存'}
+                  </WorkspaceBadge>
+                  <button
+                    type="button"
+                    onClick={() => setShowRegenForm(prev => !prev)}
+                    disabled={promptGenerating}
+                    className="inline-flex items-center gap-1 rounded-full border border-stone-200 bg-stone-100 px-2.5 py-0.5 text-[10px] font-medium text-stone-500 transition hover:border-indigo-500/50 hover:text-indigo-600 disabled:opacity-50 dark:border-zinc-700/60 dark:bg-zinc-900/80 dark:text-zinc-400 dark:hover:text-indigo-300"
+                  >
+                    <RefreshCw className="h-3 w-3" />
+                    重新生成
+                  </button>
+                </div>
+              }
+            >
+              <div className="space-y-3">
+                {selectedPromptGenerationStatus === 'running' && !promptGenerating && (
+                  <StatusBanner tone="warning">提示词正在后台生成，完成后会自动写入。</StatusBanner>
+                )}
+
+                <textarea
+                  value={promptDraft}
+                  onChange={(event) => onPromptDraftChange(event.target.value)}
+                  rows={12}
+                  placeholder="在这里直接新增或修改提示词"
+                  className={clsx(
+                    'min-h-[280px] w-full rounded-2xl border bg-zinc-950/70 px-4 py-4 font-mono text-xs leading-7 text-zinc-200 outline-none transition placeholder:text-zinc-600 focus:border-indigo-500/60 focus:ring-1 focus:ring-indigo-500/40',
+                    promptGenerating ? 'border-zinc-800/40 opacity-50' : 'border-zinc-800',
+                  )}
+                  disabled={promptGenerating}
+                />
+
+                <div className="flex items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void onPromptCopy()}
+                    disabled={!promptDraft.trim()}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-700/70 bg-zinc-950 px-3 py-1.5 text-xs font-medium text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800 disabled:opacity-40"
+                  >
+                    {promptCopied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                    {promptCopied ? '已复制' : '复制'}
+                  </button>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={onPromptReset}
+                      disabled={promptSaving}
+                      className="rounded-xl border border-stone-200 bg-white px-4 py-2 text-xs font-medium text-stone-700 transition hover:border-stone-300 hover:bg-stone-50 disabled:opacity-50 dark:border-zinc-700/70 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:border-zinc-600 dark:hover:bg-zinc-800"
+                    >
+                      还原
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void onPromptSave()}
+                      disabled={promptSaving || !promptDraft.trim()}
+                      className="rounded-xl bg-indigo-600 px-4 py-2 text-xs font-semibold text-white transition hover:bg-indigo-500 disabled:opacity-50"
+                    >
+                      {promptSaving ? '保存中…' : '保存'}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </SectionBlock>
+
+            {/* 重新生成表单 - 折叠展开 */}
+            <AnimatePresence>
+              {showRegenForm && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                  transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
+                  className="overflow-hidden"
+                >
+                  <SectionBlock
+                    icon={Wand2}
+                    title="重新生成配置"
+                    description="调整参数后重新生成将覆盖当前提示词"
+                  >
+                    {renderPromptGenerationForm()}
+                  </SectionBlock>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </>
+        )}
+      </div>
+    </div>
+  );
+
+  const renderModelRunsWorkspace = () => (
+    <div className="h-full overflow-y-auto px-3 py-4 sm:px-6 lg:px-8">
+      <div className="mx-auto max-w-5xl space-y-4 sm:space-y-6 pb-6">
+        <div className="grid gap-2 sm:gap-3 grid-cols-2 sm:grid-cols-3 md:grid-cols-5">
+          <InfoTile label="模型记录">{String(safeSelectedModelRuns.length)}</InfoTile>
+          <InfoTile label="执行副本">{String(executionRuns.length)}</InfoTile>
+          <InfoTile label="待处理">{String(executionRuns.filter((run) => run.status === 'pending').length)}</InfoTile>
+          <InfoTile label="执行中">{String(executionRuns.filter((run) => run.status === 'running').length)}</InfoTile>
+          <InfoTile label="已完成">{String(executionRuns.filter((run) => run.status === 'done').length)}</InfoTile>
+        </div>
+
+        <SectionBlock
+          icon={FileText}
+          title="工作目录"
+          description="题卡本地目录和模型执行副本会集中展示在这里。"
+        >
+          <div className="rounded-2xl border border-stone-200 bg-stone-100 px-4 py-3 font-mono text-xs leading-6 text-stone-800 dark:border-zinc-800/70 dark:bg-zinc-950/60 dark:text-zinc-300">
+            {selectedTaskDetail?.localPath || '当前题卡未记录本地目录'}
+          </div>
+        </SectionBlock>
+
+        <SectionBlock
+          icon={LayoutDashboard}
+          title="模型执行"
+          description="模型记录包含源码模型和执行副本；执行副本才会计入看板上的执行进度。"
+        >
+          {safeSelectedModelRuns.length === 0 ? (
+            <div className="rounded-2xl border border-dashed border-stone-300 bg-stone-50 px-4 py-10 text-center text-sm text-stone-500 dark:border-zinc-800 dark:bg-zinc-900/20 dark:text-zinc-500">
+              当前任务还没有模型记录。先到项目配置里的“模型列表”添加源码模型和执行副本。
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {safeSelectedModelRuns.map((run) => {
+                const presentation = modelRunPresentation(run.status);
+                const reviewMeta = reviewStatusPresentation(run.reviewStatus, run.reviewRound);
+                const codeLink = resolveModelRunCodeLink(run, sourceModelName);
+                const displayLabel = formatModelRunDisplayLabel(
+                  run.modelName,
+                  run.localPath,
+                  sourceModelName,
+                );
+                const codePushRecords = codePushRecordsByRunId.get(run.id) ?? [];
+                const currentSessionId = resolveLatestRunSession(run)?.sessionId ?? '';
+                const codePushRecord =
+                  codePushRecords.find((record) => record.sessionId === currentSessionId) ??
+                  null;
+                return (
+                  <div
+                    key={run.id}
+                    className="rounded-2xl border border-zinc-800/70 bg-zinc-900/35 px-4 py-4 select-none"
+                    onContextMenu={(e) => {
+                      if (!quickAiReviewEnabledForTaskType) return;
+                      e.preventDefault();
+                      setRunContextMenu({ run, x: e.clientX, y: e.clientY });
+                    }}
+                  >
+                    <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <presentation.icon className={clsx('h-4 w-4', presentation.iconCls)} />
+                          <span className="font-mono text-sm text-zinc-100">{displayLabel}</span>
+                          {isSourceModel(run.modelName, sourceModelName) && <WorkspaceBadge tone="neutral">源码</WorkspaceBadge>}
+                          {isOriginModel(run.modelName) && <WorkspaceBadge tone="neutral">ORIGIN</WorkspaceBadge>}
+                          <span className={clsx('inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold', presentation.badgeCls)}>
+                            {presentation.label}
+                          </span>
+                          {run.reviewStatus !== 'none' && (
+                            <span
+                              className={clsx('inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold', reviewMeta.badgeCls)}
+                              title={run.reviewNotes ?? undefined}
+                            >
+                              {reviewMeta.icon}
+                              {reviewMeta.label}
+                            </span>
+                          )}
+                        </div>
+                        <div className="mt-3 space-y-1.5 text-xs text-zinc-400">
+                          <p className="break-all">{run.localPath || '未记录副本目录'}</p>
+                          <p className="font-mono break-all">{run.branchName || '尚未创建分支'}</p>
+                          <InlineCodeLink
+                            label={codeLink.label}
+                            url={codeLink.url}
+                            copyLabel={`复制 ${run.modelName} ${codeLink.label}`}
+                          />
+                        </div>
+                        {run.reviewStatus === 'warning' && run.reviewNotes && (
+                          <p className="mt-2 text-[11px] text-amber-400/80 line-clamp-2">{run.reviewNotes}</p>
+                        )}
+                      </div>
+                      <div className="flex flex-col items-start gap-2 lg:items-end">
+                        <CodePushControls
+                          run={run}
+                          record={codePushRecord}
+                          records={codePushRecords}
+                          currentSessionId={currentSessionId}
+                          actionKey={codePushActionKey}
+                          onCommitCode={onCommitCode}
+                          onRedoCommit={onRedoCommit}
+                          onPushCode={onPushCode}
+                        />
+                        {onAiReview && aiReviewVisible && (
+                          <button
+                            type="button"
+                            aria-label={run.reviewStatus === 'running' ? '复审中…' : 'AI 复审'}
+                            disabled={!run.localPath || run.reviewStatus === 'running'}
+                            onClick={() => {
+                              if (!selectedTaskDetail?.projectConfigId) onAiReview(run);
+                              handleTabSwitch('ai-review');
+                            }}
+                            title={!run.localPath ? '需要先记录副本目录后才能发起 AI 复审' : undefined}
+                            className="inline-flex items-center gap-1.5 rounded-xl border border-violet-500/25 bg-violet-500/10 px-3 py-1.5 text-xs font-medium text-violet-200 transition hover:bg-violet-500/15 disabled:cursor-not-allowed disabled:opacity-40"
+                          >
+                            <span className="flex h-5 w-5 items-center justify-center rounded-md border border-violet-500/20 bg-violet-500/10 text-[10px] font-semibold text-violet-300">
+                              AI
+                            </span>
+                            {run.reviewStatus === 'running' ? '复审中…' : 'AI 复审'}
+                          </button>
+                        )}
+                        {codeLink.url ? (
+                          <a
+                            href={codeLink.url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex items-center gap-1.5 text-xs font-medium text-zinc-300 transition hover:text-white"
+                          >
+                            {codeLink.label === '源代码地址' ? '打开源码' : '打开代码'}
+                            <ExternalLink className="h-3.5 w-3.5" />
+                          </a>
+                        ) : (
+                          <span className="text-xs text-zinc-500">未生成代码地址</span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Model run right-click context menu */}
+          {runContextMenu && aiReviewVisible && quickAiReviewEnabledForTaskType && (
+            <>
+              <div
+                className="fixed inset-0 z-40"
+                onClick={() => setRunContextMenu(null)}
+                onContextMenu={(e) => { e.preventDefault(); setRunContextMenu(null); }}
+              />
+              <div
+                className="fixed z-50 w-52 overflow-hidden rounded-2xl border border-zinc-700/70 bg-zinc-900/95 shadow-2xl backdrop-blur-md ring-1 ring-white/5"
+                style={{ left: runContextMenu.x, top: runContextMenu.y }}
+              >
+                <div className="border-b border-zinc-800 px-3.5 py-2.5">
+                  <p className="truncate font-mono text-[11px] text-zinc-400">{runContextMenu.run.modelName}</p>
+                </div>
+                <div className="py-1">
+                  <button
+                    type="button"
+                    disabled={!runContextMenu.run.localPath || runContextMenu.run.reviewStatus === 'running'}
+                    onClick={() => {
+                      if (onAiReview) {
+                        if (!selectedTaskDetail?.projectConfigId) onAiReview(runContextMenu.run);
+                        handleTabSwitch('ai-review');
+                      }
+                      setRunContextMenu(null);
+                    }}
+                    className="flex w-full items-center gap-2.5 px-3.5 py-2.5 text-left text-[13px] font-medium text-zinc-200 transition hover:bg-zinc-800/70 disabled:opacity-40 disabled:cursor-not-allowed cursor-default"
+                  >
+                    <span className="flex h-6 w-6 items-center justify-center rounded-lg border border-violet-500/20 bg-violet-500/10 text-violet-300 text-[11px]">
+                      AI
+                    </span>
+                    {runContextMenu.run.reviewStatus === 'running' ? '复审中…' : 'AI 复审'}
+                  </button>
+                </div>
+              </div>
+            </>
+          )}
+        </SectionBlock>
+      </div>
+    </div>
+  );
+
+  const renderAiReviewWorkspace = () => {
+    // Group rounds by modelRunId (fall back to localPath when modelRunId is null)
+    const allRounds = selectedAiReviewRounds ?? [];
+
+    type RoundGroup = {
+      groupKey: string;
+      modelRunId: string | null;
+      modelName: string;
+      localPath: string;
+      rounds: typeof allRounds;
+      latestRound: typeof allRounds[number] | null;
+    };
+
+    // Build an ordered list of groups preserving first-seen insertion order
+    const groupMap = new Map<string, RoundGroup>();
+    for (const round of allRounds) {
+      const key = round.modelRunId ?? round.localPath ?? 'unlinked';
+      if (!groupMap.has(key)) {
+        groupMap.set(key, {
+          groupKey: key,
+          modelRunId: round.modelRunId,
+          modelName: round.modelName,
+          localPath: round.localPath,
+          rounds: [],
+          latestRound: null,
+        });
+      }
+      groupMap.get(key)!.rounds.push(round);
+    }
+    // Sort each group's rounds by roundNumber ASC and determine latestRound
+    const groups: RoundGroup[] = [];
+    for (const group of groupMap.values()) {
+      group.rounds.sort((a, b) => a.roundNumber - b.roundNumber);
+      group.latestRound = group.rounds[group.rounds.length - 1] ?? null;
+      groups.push(group);
+    }
+
+    // Stats derived from rounds
+    const roundPassCount = allRounds.filter((r) => r.status === 'pass').length;
+    const roundWarningCount = allRounds.filter((r) => r.status === 'warning').length;
+    const roundRunningCount = allRounds.filter((r) => r.status === 'running').length;
+
+    return (
+      <div className="h-full overflow-y-auto px-4 py-5 sm:px-6 lg:px-8">
+        <div className="mx-auto max-w-5xl space-y-6 pb-6">
+          {/* 润色错误提示 */}
+          {polishError && (
+            <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+              {polishError}
+            </div>
+          )}
+
+          {/* 统计概况 */}
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+            <div className="grid flex-1 gap-3 md:grid-cols-4">
+              <InfoTile label="复审轮次">{String(allRounds.length)}</InfoTile>
+              <InfoTile label="复审通过">{String(roundPassCount)}</InfoTile>
+              <InfoTile label="复审未过">{String(roundWarningCount)}</InfoTile>
+              <InfoTile label="复审中">{String(roundRunningCount)}</InfoTile>
+            </div>
+            {onResetAiReview && (
+              <button
+                type="button"
+                disabled={aiReviewResetting || roundRunningCount > 0}
+                onClick={() => {
+                  void onResetAiReview();
+                }}
+                title={roundRunningCount > 0 ? '复审任务运行中，完成或取消后才能重置' : undefined}
+                className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-red-500/25 bg-red-500/10 px-3 text-xs font-medium text-red-200 transition hover:bg-red-500/15 disabled:cursor-not-allowed disabled:opacity-45"
+              >
+                {aiReviewResetting ? (
+                  <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Trash2 className="h-3.5 w-3.5" />
+                )}
+                {aiReviewResetting ? '重置中…' : '重置复审'}
+              </button>
+            )}
+          </div>
+
+          {/* 每个模型执行的复审轮次列表 */}
+          {groups.length === 0 ? (
+            <SectionBlock
+              icon={CheckCircle2}
+              title="线性复审"
+              description="每次复审以轮次记录，可持续迭代直到满意为止。"
+            >
+              <div className="rounded-2xl border border-dashed border-stone-300 bg-stone-50 px-4 py-10 text-center text-sm text-stone-500 dark:border-zinc-800 dark:bg-zinc-900/20 dark:text-zinc-500">
+                还没有复审记录。先在「执行概况」里对模型执行副本发起首轮 AI 复审。
+              </div>
+            </SectionBlock>
+          ) : (
+            groups.map((group) => {
+              const latestStatus = group.latestRound?.status ?? 'none';
+              const latestReviewMeta =
+                latestStatus === 'none'
+                  ? null
+                  : reviewStatusPresentation(latestStatus, group.latestRound?.roundNumber ?? 1);
+
+              // Draft key for next-round prompt textarea
+              const draftKey = group.groupKey;
+              // Pre-fill: use explicit state draft if the user has typed something,
+              // otherwise fall back to the latest round's nextPrompt
+              const nextPromptDraft =
+                nextRoundPromptDrafts[draftKey] !== undefined
+                  ? nextRoundPromptDrafts[draftKey]
+                  : (group.latestRound?.nextPrompt ?? '');
+              const nextPromptTaskTypeDraft =
+                nextRoundTaskTypeDrafts[draftKey] ??
+                normalizeNextPromptTaskType(group.latestRound?.nextPromptTaskType, nextPromptDraft);
+              const latestReviewFailed =
+                latestStatus === 'warning' &&
+                group.latestRound?.isCompleted === false &&
+                group.latestRound?.isSatisfied === false &&
+                group.latestRound?.reviewNotes.trim().startsWith('复审执行失败');
+
+              // Find matching ModelRunFromDB for the "启动首轮复审" fallback button
+              const matchingModelRun = safeSelectedModelRuns.find(
+                (r) => r.id === group.modelRunId,
+              ) ?? null;
+
+              return (
+                <div key={group.groupKey}>
+                <SectionBlock
+                  icon={CheckCircle2}
+                  title={group.modelName || group.localPath || '未知模型'}
+                  description={group.localPath || '未记录目录'}
+                  badge={
+                    latestReviewMeta ? (
+                      <span
+                        className={clsx(
+                          'inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[10px] font-semibold',
+                          latestReviewMeta.badgeCls,
+                        )}
+                      >
+                        {latestReviewMeta.icon}
+                        {latestReviewMeta.label}
+                      </span>
+                    ) : (
+                      <WorkspaceBadge tone="neutral">未复审</WorkspaceBadge>
+                    )
+                  }
+                >
+                  {/* 轮次卡片列表 */}
+                  {group.rounds.length === 0 ? (
+                    <div className="rounded-2xl border border-dashed border-zinc-800 px-4 py-8 text-center text-sm text-zinc-500">
+                      暂无复审记录。
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {group.rounds.map((round) => {
+                        const roundMeta =
+                          round.status === 'none'
+                            ? null
+                            : reviewStatusPresentation(round.status, round.roundNumber);
+                        const promptExpanded = expandedRoundPrompts.has(round.id);
+                        const summaryText =
+                          polishedDissatisfactionSummaries[round.id] ??
+                          round.dissatisfactionSummary ??
+                          '';
+
+                        return (
+                          <div
+                            key={round.id}
+                            className="overflow-hidden rounded-xl border border-zinc-800/70 bg-zinc-900/40"
+                          >
+                            {/* 轮次头部 */}
+                            <div className="flex flex-wrap items-center gap-2 px-3.5 py-2.5">
+                              <span className="shrink-0 rounded-md bg-violet-500/15 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-violet-300">
+                                第 {round.roundNumber} 轮
+                              </span>
+                              {round.status === 'running' && (
+                                <RefreshCw className="h-3.5 w-3.5 animate-spin text-violet-300" />
+                              )}
+                              {roundMeta ? (
+                                <span
+                                  className={clsx(
+                                    'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold',
+                                    roundMeta.badgeCls,
+                                  )}
+                                >
+                                  {roundMeta.icon}
+                                  {roundMeta.label}
+                                </span>
+                              ) : (
+                                <WorkspaceBadge tone="neutral">进行中</WorkspaceBadge>
+                              )}
+                              <PromptDifficultyBadge difficulty={round.promptDifficulty} />
+                              {round.isCompleted !== null && (
+                                <AiReviewDecisionBadge label="是否完成" value={round.isCompleted} />
+                              )}
+                              {round.isSatisfied !== null && (
+                                <AiReviewDecisionBadge label="是否满意" value={round.isSatisfied} />
+                              )}
+                              <div className="ml-auto flex items-center gap-1.5">
+                                <span className="text-[10px] text-zinc-600">
+                                  {formatAiReviewTimestamp(round.createdAt)}
+                                </span>
+                                {onResetAiReviewRound && (
+                                  <button
+                                    type="button"
+                                    disabled={round.status === 'running' || resettingAiReviewRoundId === round.id}
+                                    onClick={() => {
+                                      void handleResetAiReviewRound(round.id, `第 ${round.roundNumber} 轮`);
+                                    }}
+                                    title={round.status === 'running' ? '复审任务运行中，完成或取消后才能重置' : '重置本轮'}
+                                    className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-red-500/25 bg-red-500/10 text-red-200 transition hover:bg-red-500/15 disabled:cursor-not-allowed disabled:opacity-40"
+                                  >
+                                    {resettingAiReviewRoundId === round.id ? (
+                                      <RefreshCw className="h-3 w-3 animate-spin" />
+                                    ) : (
+                                      <Trash2 className="h-3 w-3" />
+                                    )}
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+
+                            {/* 使用提示词 - 可展开 */}
+                            <div className="border-t border-zinc-800/40">
+                              <button
+                                type="button"
+                                className="flex w-full items-center gap-1.5 px-3.5 py-2 text-left transition hover:bg-zinc-800/30"
+                                onClick={() =>
+                                  setExpandedRoundPrompts((prev) => {
+                                    const next = new Set(prev);
+                                    if (next.has(round.id)) next.delete(round.id);
+                                    else next.add(round.id);
+                                    return next;
+                                  })
+                                }
+                              >
+                                {promptExpanded ? (
+                                  <ChevronDown className="h-3 w-3 shrink-0 text-zinc-500" />
+                                ) : (
+                                  <ChevronRight className="h-3 w-3 shrink-0 text-zinc-500" />
+                                )}
+                                <span className="text-[10px] font-medium text-zinc-500">使用提示词</span>
+                              </button>
+                              {promptExpanded && (
+                                <div className="px-3.5 pb-3">
+                                  <div className="rounded-lg border border-indigo-500/20 bg-indigo-500/8 px-3 py-2.5">
+                                    <p className="whitespace-pre-wrap text-xs leading-5 text-indigo-100/90">
+                                      {round.promptText || (
+                                        <span className="text-indigo-300/30">（无提示词）</span>
+                                      )}
+                                    </p>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+
+                            {/* 结论 */}
+                            {round.reviewNotes?.trim() && (
+                              <div className="border-t border-zinc-800/40 px-3.5 py-3">
+                                <div className="flex items-center gap-1.5">
+                                  <p className="text-[10px] font-medium text-amber-400/70">结论</p>
+                                  <CopyIconButton
+                                    value={polishedNotes[round.id] ?? round.reviewNotes}
+                                    label="复制结论"
+                                    className="rounded p-0.5 text-zinc-500 transition hover:bg-zinc-800/40 hover:text-zinc-300"
+                                    iconClassName="h-3 w-3"
+                                  />
+                                  <button
+                                    type="button"
+                                    disabled={polishingKeys.has(`notes-${round.id}`)}
+                                    onClick={() =>
+                                      void handlePolish(
+                                        `notes-${round.id}`,
+                                        round.reviewNotes,
+                                        (polished) => setPolishedNotes((prev) => ({ ...prev, [round.id]: polished })),
+                                        50,
+                                      )
+                                    }
+                                    title="润色"
+                                    className="rounded p-0.5 text-zinc-500 transition hover:bg-zinc-800/40 hover:text-zinc-300 disabled:opacity-40"
+                                  >
+                                    {polishingKeys.has(`notes-${round.id}`) ? (
+                                      <RefreshCw className="h-3 w-3 animate-spin" />
+                                    ) : (
+                                      <Wand2 className="h-3 w-3" />
+                                    )}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={savingRoundNotes.has(round.id)}
+                                    onClick={() =>
+                                      void handleSaveRoundNotes(
+                                        round.id,
+                                        group.groupKey,
+                                        round.reviewNotes,
+                                        round.nextPrompt ?? '',
+                                        normalizeNextPromptTaskType(round.nextPromptTaskType, round.nextPrompt),
+                                      )
+                                    }
+                                    title="保存"
+                                    className="rounded p-0.5 text-zinc-500 transition hover:bg-zinc-800/40 hover:text-zinc-300 disabled:opacity-40"
+                                  >
+                                    {savingRoundNotes.has(round.id) ? (
+                                      <RefreshCw className="h-3 w-3 animate-spin" />
+                                    ) : (
+                                      <Check className="h-3 w-3" />
+                                    )}
+                                  </button>
+                                </div>
+                                {editingNoteId === round.id ? (
+                                  <div className="mt-1.5 space-y-1.5">
+                                    <textarea
+                                      autoFocus
+                                      rows={4}
+                                      value={editingNoteDraft}
+                                      onChange={(e) => setEditingNoteDraft(e.target.value)}
+                                      onKeyDown={(e) => {
+                                        if (e.key === 'Escape') {
+                                          setEditingNoteId(null);
+                                        }
+                                      }}
+                                      className="w-full resize-y rounded-lg border border-amber-500/30 bg-black/20 px-2.5 py-2 text-xs leading-5 text-amber-100/90 outline-none transition focus:border-amber-500/50 focus:ring-1 focus:ring-amber-500/20"
+                                    />
+                                    <div className="flex items-center gap-2">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          const trimmed = editingNoteDraft.trim();
+                                          if (trimmed) {
+                                            setPolishedNotes((prev) => ({ ...prev, [round.id]: trimmed }));
+                                          }
+                                          setEditingNoteId(null);
+                                        }}
+                                        className="text-[10px] text-amber-400/70 hover:text-amber-300"
+                                      >
+                                        确认
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => setEditingNoteId(null)}
+                                        className="text-[10px] text-zinc-500 hover:text-zinc-300"
+                                      >
+                                        取消
+                                      </button>
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <>
+                                    <p
+                                      title="双击编辑"
+                                      onDoubleClick={() => {
+                                        setEditingNoteId(round.id);
+                                        setEditingNoteDraft(polishedNotes[round.id] ?? round.reviewNotes ?? '');
+                                      }}
+                                      className="mt-1.5 cursor-text whitespace-pre-wrap text-xs leading-5 text-amber-100/80"
+                                    >
+                                      {polishedNotes[round.id] ?? round.reviewNotes}
+                                    </p>
+                                    {polishedNotes[round.id] && (
+                                      <button
+                                        type="button"
+                                        onClick={() => setPolishedNotes((prev) => {
+                                          const next = { ...prev };
+                                          delete next[round.id];
+                                          return next;
+                                        })}
+                                        className="mt-1 text-[10px] text-zinc-500 hover:text-zinc-300"
+                                      >
+                                        恢复原文
+                                      </button>
+                                    )}
+                                  </>
+                                )}
+                              </div>
+                            )}
+
+                            {/* 导出用不满意原因总结 */}
+                            {round.isSatisfied === false && (
+                              <div className="border-t border-zinc-800/40 px-3.5 py-3">
+                                <div className="flex items-center gap-1.5">
+                                  <p className="text-[10px] font-medium text-sky-300/75">不满意原因总结</p>
+                                  <CopyIconButton
+                                    value={summaryText}
+                                    label="复制不满意原因总结"
+                                    className="rounded p-0.5 text-zinc-500 transition hover:bg-zinc-800/40 hover:text-zinc-300"
+                                    iconClassName="h-3 w-3"
+                                  />
+                                  <button
+                                    type="button"
+                                    disabled={!summaryText.trim() || polishingKeys.has(`summary-${round.id}`)}
+                                    onClick={() =>
+                                      void handlePolish(
+                                        `summary-${round.id}`,
+                                        summaryText,
+                                        (polished) =>
+                                          setPolishedDissatisfactionSummaries((prev) => ({
+                                            ...prev,
+                                            [round.id]: polished,
+                                          })),
+                                        50,
+                                      )
+                                    }
+                                    title="润色"
+                                    className="rounded p-0.5 text-zinc-500 transition hover:bg-zinc-800/40 hover:text-zinc-300 disabled:opacity-40"
+                                  >
+                                    {polishingKeys.has(`summary-${round.id}`) ? (
+                                      <RefreshCw className="h-3 w-3 animate-spin" />
+                                    ) : (
+                                      <Wand2 className="h-3 w-3" />
+                                    )}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={savingRoundSummaries.has(round.id)}
+                                    onClick={() =>
+                                      void handleSaveDissatisfactionSummary(
+                                        round.id,
+                                        round.dissatisfactionSummary ?? '',
+                                      )
+                                    }
+                                    title="保存不满意原因总结"
+                                    className="rounded p-0.5 text-zinc-500 transition hover:bg-zinc-800/40 hover:text-zinc-300 disabled:opacity-40"
+                                  >
+                                    {savingRoundSummaries.has(round.id) ? (
+                                      <RefreshCw className="h-3 w-3 animate-spin" />
+                                    ) : (
+                                      <Check className="h-3 w-3" />
+                                    )}
+                                  </button>
+                                </div>
+                                {editingSummaryId === round.id ? (
+                                  <div className="mt-1.5 space-y-1.5">
+                                    <textarea
+                                      autoFocus
+                                      rows={5}
+                                      value={editingSummaryDraft}
+                                      onChange={(e) => setEditingSummaryDraft(e.target.value)}
+                                      onKeyDown={(e) => {
+                                        if (e.key === 'Escape') {
+                                          setEditingSummaryId(null);
+                                        }
+                                      }}
+                                      className="w-full resize-y rounded-lg border border-sky-500/30 bg-black/20 px-2.5 py-2 text-xs leading-5 text-sky-50/90 outline-none transition focus:border-sky-500/50 focus:ring-1 focus:ring-sky-500/20"
+                                    />
+                                    <div className="flex items-center gap-2">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setPolishedDissatisfactionSummaries((prev) => ({
+                                            ...prev,
+                                            [round.id]: editingSummaryDraft.trim(),
+                                          }));
+                                          setEditingSummaryId(null);
+                                        }}
+                                        className="text-[10px] text-sky-300/75 hover:text-sky-200"
+                                      >
+                                        确认
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => setEditingSummaryId(null)}
+                                        className="text-[10px] text-zinc-500 hover:text-zinc-300"
+                                      >
+                                        取消
+                                      </button>
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <>
+                                    <p
+                                      title="双击编辑"
+                                      onDoubleClick={() => {
+                                        setEditingSummaryId(round.id);
+                                        setEditingSummaryDraft(summaryText);
+                                      }}
+                                      className={clsx(
+                                        'mt-1.5 cursor-text whitespace-pre-wrap text-xs leading-5',
+                                        summaryText.trim() ? 'text-sky-50/80' : 'text-zinc-500',
+                                      )}
+                                    >
+                                      {summaryText.trim() || '暂无总结，可双击手动填写后保存。'}
+                                    </p>
+                                    {polishedDissatisfactionSummaries[round.id] !== undefined && (
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          setPolishedDissatisfactionSummaries((prev) => {
+                                            const next = { ...prev };
+                                            delete next[round.id];
+                                            return next;
+                                          })
+                                        }
+                                        className="mt-1 text-[10px] text-zinc-500 hover:text-zinc-300"
+                                      >
+                                        恢复原文
+                                      </button>
+                                    )}
+                                  </>
+                                )}
+                              </div>
+                            )}
+
+                            {/* 额外元信息 */}
+                            {(round.projectType || round.changeScope || round.keyLocations) && (
+                              <div className="border-t border-zinc-800/40 px-3.5 py-2.5 space-y-1.5">
+                                {(round.projectType || round.changeScope) && (
+                                  <div className="flex flex-wrap gap-1.5">
+                                    {round.projectType && (
+                                      <WorkspaceBadge tone="blue">{round.projectType}</WorkspaceBadge>
+                                    )}
+                                    {round.changeScope && (
+                                      <WorkspaceBadge tone="neutral">{round.changeScope}</WorkspaceBadge>
+                                    )}
+                                  </div>
+                                )}
+                                {round.keyLocations && (
+                                  <div className="rounded-lg border border-zinc-800/60 bg-black/15 px-2.5 py-1.5">
+                                    <p className="text-[10px] font-medium text-zinc-500">关键代码位置</p>
+                                    <p className="mt-0.5 break-all font-mono text-[11px] leading-5 text-zinc-400">
+                                      {round.keyLocations}
+                                    </p>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {/* 下一轮操作区 */}
+                  <div className="mt-4 space-y-2.5 rounded-xl border border-zinc-800/50 bg-zinc-900/30 px-3.5 py-3.5">
+                    <div className="flex items-center gap-1.5">
+                      <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-zinc-500">
+                        下一轮提示词
+                      </p>
+                      <CopyIconButton
+                        value={nextPromptDraft}
+                        label="复制提示词"
+                        className="rounded p-0.5 text-zinc-500 transition hover:bg-zinc-800/40 hover:text-zinc-300"
+                        iconClassName="h-3 w-3"
+                      />
+                      <button
+                        type="button"
+                        disabled={!nextPromptDraft.trim() || polishingKeys.has(`draft-${draftKey}`)}
+                        onClick={() =>
+                          void handlePolish(
+                            `draft-${draftKey}`,
+                            nextPromptDraft,
+                            (polished) => setNextRoundPromptDrafts((prev) => ({ ...prev, [draftKey]: polished })),
+                          )
+                        }
+                        title="润色"
+                        className="rounded p-0.5 text-zinc-500 transition hover:bg-zinc-800/40 hover:text-zinc-300 disabled:opacity-40"
+                      >
+                        {polishingKeys.has(`draft-${draftKey}`) ? (
+                          <RefreshCw className="h-3 w-3 animate-spin" />
+                        ) : (
+                          <Wand2 className="h-3 w-3" />
+                        )}
+                      </button>
+                      {group.latestRound && (
+                        <button
+                          type="button"
+                          disabled={savingRoundNotes.has(group.latestRound.id)}
+                        onClick={() =>
+                          void handleSaveRoundNotes(
+                            group.latestRound!.id,
+                            group.groupKey,
+                            group.latestRound!.reviewNotes ?? '',
+                            group.latestRound!.nextPrompt ?? '',
+                            normalizeNextPromptTaskType(group.latestRound!.nextPromptTaskType, group.latestRound!.nextPrompt),
+                          )
+                        }
+                          title="保存下一轮提示词"
+                          className="rounded p-0.5 text-zinc-500 transition hover:bg-zinc-800/40 hover:text-zinc-300 disabled:opacity-40"
+                        >
+                          {savingRoundNotes.has(group.latestRound.id) ? (
+                            <RefreshCw className="h-3 w-3 animate-spin" />
+                          ) : (
+                            <Check className="h-3 w-3" />
+                          )}
+                        </button>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-[10px] font-medium text-zinc-500">提示词类型</span>
+                      <select
+                        value={nextPromptTaskTypeDraft}
+                        onChange={(e) =>
+                          setNextRoundTaskTypeDrafts((prev) => ({
+                            ...prev,
+                            [draftKey]: e.target.value,
+                          }))
+                        }
+                        className="rounded-lg border border-zinc-700/60 bg-black/20 px-2 py-1 text-xs text-zinc-200 outline-none transition focus:border-indigo-500/50 focus:ring-1 focus:ring-indigo-500/30"
+                      >
+                        {DEFAULT_TASK_TYPES.map((taskType) => (
+                          <option key={taskType} value={taskType}>
+                            {getTaskTypePresentation(taskType).label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <textarea
+                      rows={3}
+                      value={nextPromptDraft}
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        setNextRoundPromptDrafts((prev) => ({
+                          ...prev,
+                          [draftKey]: value,
+                        }));
+                        if (nextRoundTaskTypeDrafts[draftKey] === undefined) {
+                          setNextRoundTaskTypeDrafts((prev) => ({
+                            ...prev,
+                            [draftKey]: inferNextPromptTaskType(value),
+                          }));
+                        }
+                      }}
+                      placeholder={
+                        group.rounds.length === 0
+                          ? '填写首轮复审提示词（留空则使用默认提示词）'
+                          : '填写下一轮复审要追加的提示词，留空则沿用上一轮建议…'
+                      }
+                      className="w-full resize-y rounded-lg border border-zinc-700/60 bg-black/20 px-2.5 py-2 text-xs leading-5 text-zinc-200 outline-none transition focus:border-indigo-500/50 focus:ring-1 focus:ring-indigo-500/30 placeholder:text-zinc-600"
+                    />
+                    {group.rounds.length === 0 && matchingModelRun && onAiReview ? (
+                      // No rounds yet — show "启动首轮复审" via the existing onAiReview prop
+                      <button
+                        type="button"
+                        disabled={!group.localPath || latestStatus === 'running'}
+                        onClick={() => {
+                          if (!selectedTaskDetail?.projectConfigId) onAiReview(matchingModelRun);
+                        }}
+                        className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-violet-500/25 bg-violet-500/10 px-3 py-1.5 text-xs font-medium text-violet-200 transition hover:bg-violet-500/15 disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        <span className="flex h-4 w-4 items-center justify-center rounded border border-violet-500/20 bg-violet-500/10 text-[9px] font-semibold text-violet-300">
+                          AI
+                        </span>
+                        启动首轮复审
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={
+                          !onSubmitNextAiReviewRound ||
+                          !group.localPath ||
+                          latestStatus === 'running'
+                        }
+                        onClick={() => {
+                          if (!onSubmitNextAiReviewRound || !group.modelRunId) return;
+                          void onSubmitNextAiReviewRound(
+                            group.modelRunId,
+                            group.modelName,
+                            group.localPath,
+                            latestReviewFailed ? undefined : nextPromptDraft.trim() || undefined,
+                            latestReviewFailed ? group.latestRound?.id : undefined,
+                          );
+                        }}
+                        className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-violet-500/25 bg-violet-500/10 px-3 py-1.5 text-xs font-medium text-violet-200 transition hover:bg-violet-500/15 disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        {latestStatus === 'running' ? (
+                          <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <span className="flex h-4 w-4 items-center justify-center rounded border border-violet-500/20 bg-violet-500/10 text-[9px] font-semibold text-violet-300">
+                            AI
+                          </span>
+                        )}
+                        {latestStatus === 'running'
+                          ? '复审中…'
+                          : group.rounds.length === 0
+                          ? '启动首轮复审'
+                          : latestReviewFailed
+                          ? '重试复审'
+                          : '启动下一轮复审'}
+                      </button>
+                    )}
+                  </div>
+                </SectionBlock>
+                </div>
+              );
+            })
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <>
+      <motion.div
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        className="fixed inset-0 z-20 bg-[radial-gradient(circle_at_top,rgba(99,102,241,0.16),transparent_28%),rgba(0,0,0,0.3)] backdrop-blur-xl dark:bg-[radial-gradient(circle_at_top,rgba(99,102,241,0.16),transparent_28%),rgba(0,0,0,0.78)]"
+      />
+      <motion.div
+        initial={{ opacity: 0, y: 18, scale: 0.985 }}
+        animate={{ opacity: 1, y: 0, scale: 1 }}
+        exit={{ opacity: 0, y: 18, scale: 0.985 }}
+        transition={{ type: 'spring', damping: 22, stiffness: 220 }}
+        onClick={onClose}
+        className="fixed inset-0 z-30 flex items-center justify-center p-2 sm:p-4 lg:p-6"
+      >
+        <div
+          onClick={(event) => event.stopPropagation()}
+          className="flex h-full max-h-[calc(100vh-1rem)] sm:max-h-[calc(100vh-2rem)] lg:max-h-[960px] w-full max-w-[1420px] flex-col overflow-hidden rounded-[24px] sm:rounded-[28px] border border-stone-200 bg-white shadow-[0_30px_120px_rgba(0,0,0,0.15)] ring-1 ring-black/5 dark:border-zinc-800/80 dark:bg-[#0a0a0c]/95 dark:shadow-[0_30px_120px_rgba(0,0,0,0.55)] dark:ring-white/5"
+        >
+          <header className="border-b border-stone-200 bg-white px-3 py-2.5 sm:px-5 sm:py-3.5 lg:px-6 dark:border-zinc-800/70 dark:bg-[#0b0b0e]">
+            <div className="flex flex-col gap-2 sm:gap-3 lg:flex-row lg:items-center lg:justify-between">
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className={clsx('h-2 w-2 rounded-full', statusMeta[selected.status].dotCls)} />
+                  <select
+                    value={selected.status}
+                    disabled={statusChanging}
+                    onChange={(event) => onStatusChange(selected.id, event.target.value as TaskStatus)}
+                    className={clsx(
+                      'rounded-full border px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.22em] outline-none',
+                      taskStatusTone(selected.status),
+                    )}
+                  >
+                    {statusOptions.map((status) => (
+                      <option key={status} value={status}>
+                        {statusMeta[status].label}
+                      </option>
+                    ))}
+                  </select>
+                  <WorkspaceBadge tone="neutral">{sessionListDraft.length || 1} 个 session</WorkspaceBadge>
+                  <span className={clsx('inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold', promptStatusTone(selectedPromptGenerationStatus))}>
+                    提示词 {selectedPromptGenerationMeta.label}
+                  </span>
+                </div>
+                <h2 className="mt-1.5 sm:mt-3 truncate text-lg sm:text-xl font-semibold tracking-tight text-stone-900 dark:text-white">{selected.projectName}</h2>
+                <div className="mt-1 flex flex-wrap items-center gap-3 text-[11px] text-stone-500 dark:text-zinc-500">
+                  <span className="inline-flex items-center gap-1 font-mono">
+                    <Hash className="h-3.5 w-3.5" />
+                    #{selected.projectId}
+                  </span>
+                  <span className="font-mono text-zinc-600" title={selected.id}>
+                    {formatTaskDisplayId(selected)}
+                  </span>
+                  <span>{createdAtText}</span>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 sm:gap-3">
+                <div className="inline-flex max-w-full overflow-x-auto rounded-xl border border-stone-200 bg-stone-100/80 p-0.5 sm:p-1 dark:border-zinc-800 dark:bg-zinc-900/80">
+                  {availableTabItems.map((tab) => {
+                    const Icon = tab.icon;
+                    const active = effectiveActiveDrawerTab === tab.id;
+                    return (
+                      <button
+                        key={tab.id}
+                        type="button"
+                        onClick={() => handleTabSwitch(tab.id)}
+                        className={clsx(
+                          'inline-flex shrink-0 items-center gap-1.5 rounded-lg px-2.5 py-1.5 sm:px-3 sm:py-2 text-xs font-medium transition',
+                          active ? 'bg-white text-stone-900 shadow-sm dark:bg-zinc-800 dark:text-white' : 'text-stone-500 hover:text-stone-700 dark:text-zinc-400 dark:hover:text-zinc-200',
+                        )}
+                      >
+                        <Icon className="h-3.5 w-3.5" />
+                        {tab.label}
+                      </button>
+                    );
+                  })}
+              </div>
+
+                <ActionIconButton label="关闭" onClick={onClose}>
+                  <X className="h-4 w-4" />
+                </ActionIconButton>
+              </div>
+            </div>
+          </header>
+
+          {escCloseHintVisible && (
+            <div className="border-b border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100 sm:px-5 lg:px-6">
+              <div className="flex items-center gap-2">
+                <AlertCircle className="h-4 w-4 flex-shrink-0 text-amber-300" />
+                <span>再按一次 </span>
+                <kbd className="rounded-md border border-amber-400/30 bg-amber-500/10 px-1.5 py-0.5 font-mono text-[11px] text-amber-200">
+                  Esc
+                </kbd>
+                <span> 关闭这个编辑框</span>
+              </div>
+            </div>
+          )}
+
+          {drawerError && (
+            <div className="border-b border-red-500/15 bg-red-500/10 px-4 py-3 text-sm text-red-200 sm:px-5 lg:px-6">
+              {drawerError}
+            </div>
+          )}
+
+          <div className="min-h-0 flex-1 overflow-hidden bg-stone-50 dark:bg-[#09090b]">
+            {drawerLoading ? (
+              <div className="flex h-full items-center justify-center text-sm text-zinc-500">正在加载任务详情…</div>
+            ) : (
+              <>
+                {effectiveActiveDrawerTab === 'sessions' && renderSessionsWorkspace()}
+                {(effectiveActiveDrawerTab === 'container' || containerPanelTaskId === selected.id) && (
+                  <div key={selected.id} hidden={effectiveActiveDrawerTab !== 'container'} className="h-full overflow-y-auto">
+                    {selectedTaskDetail?.projectConfigId ? (
+                      <AnnotationWorkspace
+                        projectId={selectedTaskDetail.projectConfigId}
+                        taskId={selected.id}
+                        promptText={promptDraft}
+                        onPromptCopy={onPromptCopy}
+                      />
+                    ) : (
+                      <p className="p-6 text-sm text-stone-500">当前题目尚未关联项目，请先确认题目的项目归属。</p>
+                    )}
+                  </div>
+                )}
+                {effectiveActiveDrawerTab === 'prompt' && renderPromptWorkspace()}
+                {effectiveActiveDrawerTab === 'model-runs' && renderModelRunsWorkspace()}
+                {effectiveActiveDrawerTab === 'readme' && renderReadmeWorkspace()}
+                {effectiveActiveDrawerTab === 'ai-review' && (selectedTaskDetail?.projectConfigId ? (
+                  <div className="h-full overflow-y-auto">
+                    <AnnotationWorkspace projectId={selectedTaskDetail.projectConfigId} taskId={selected.id} view="review" />
+                  </div>
+                ) : aiReviewVisible && renderAiReviewWorkspace())}
+              </>
+            )}
+          </div>
+
+          <footer className="border-t border-stone-200 bg-white px-4 py-2.5 sm:px-5 sm:py-3.5 lg:px-6 dark:border-zinc-800/70 dark:bg-[#0b0b0e]">
+            <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+              <button
+                type="button"
+                onClick={onOpenSubmit}
+                className="rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-indigo-500"
+              >
+                提交代码
+              </button>
+            </div>
+          </footer>
+        </div>
+      </motion.div>
+    </>
+  );
+}
+
+function ActionIconButton({
+  children,
+  danger,
+  disabled,
+  label,
+  onClick,
+}: {
+  children: React.ReactNode;
+  danger?: boolean;
+  disabled?: boolean;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      title={label}
+      onClick={onClick}
+      disabled={disabled}
+      className={clsx(
+        'inline-flex h-9 w-9 items-center justify-center rounded-xl border transition',
+        danger
+          ? 'border-red-500/20 bg-red-500/10 text-red-600 hover:bg-red-500/15 dark:text-red-300'
+          : 'border-stone-200 bg-white text-stone-500 hover:border-stone-300 hover:bg-stone-50 hover:text-stone-700 dark:border-zinc-700/70 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:border-zinc-600 dark:hover:bg-zinc-800 dark:hover:text-white',
+        disabled && 'cursor-not-allowed opacity-50 hover:border-red-500/20 hover:bg-red-500/10 hover:text-red-300',
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+function InlineCodeLink({
+  label,
+  url,
+  copyLabel,
+}: {
+  label: string;
+  url: string | null;
+  copyLabel: string;
+}) {
+  if (!url) {
+    return (
+      <p className="flex items-center gap-2">
+        <span className="shrink-0 text-zinc-500">{label}</span>
+        <span className="font-mono text-zinc-600">未生成</span>
+      </p>
+    );
+  }
+
+  return (
+    <div className="flex items-start gap-2">
+      <span className="shrink-0 text-zinc-500">{label}</span>
+      <a
+        href={url}
+        target="_blank"
+        rel="noreferrer"
+        title={url}
+        className="min-w-0 flex-1 break-all font-mono text-zinc-300 transition hover:text-white"
+      >
+        {url}
+      </a>
+      <div className="flex items-center gap-1">
+        <CopyIconButton
+          value={url}
+          label={copyLabel}
+          className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-zinc-800 bg-black/20 text-zinc-400 transition hover:border-zinc-700 hover:bg-zinc-900 hover:text-white"
+          iconClassName="h-3.5 w-3.5"
+        />
+        <a
+          href={url}
+          target="_blank"
+          rel="noreferrer"
+          title={`打开 ${label}`}
+          className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-zinc-800 bg-black/20 text-zinc-400 transition hover:border-zinc-700 hover:bg-zinc-900 hover:text-white"
+        >
+          <ExternalLink className="h-3.5 w-3.5" />
+        </a>
+      </div>
+    </div>
+  );
+}
+
+function resolveLatestRunSession(run: ModelRunFromDB): { sessionId: string; sessionIndex: number } | null {
+  const sessions = Array.isArray(run.sessionList) ? run.sessionList : [];
+  for (let index = sessions.length - 1; index >= 0; index -= 1) {
+    const sessionId = sessions[index]?.sessionId?.trim();
+    if (sessionId) {
+      return { sessionId, sessionIndex: index };
+    }
+  }
+  const fallbackSessionId = run.sessionId?.trim();
+  if (fallbackSessionId) {
+    return {
+      sessionId: fallbackSessionId,
+      sessionIndex: Math.max(run.conversationRounds - 1, 0),
+    };
+  }
+  return null;
+}
+
+function CodePushControls({
+  run,
+  record,
+  records,
+  currentSessionId,
+  actionKey,
+  onCommitCode,
+  onRedoCommit,
+  onPushCode,
+}: {
+  run: ModelRunFromDB;
+  record: CodePushRecord | null;
+  records: CodePushRecord[];
+  currentSessionId: string;
+  actionKey: string | null;
+  onCommitCode?: (run: ModelRunFromDB) => void | Promise<void>;
+  onRedoCommit?: (record: CodePushRecord) => void | Promise<void>;
+  onPushCode?: (record: CodePushRecord) => void | Promise<void>;
+}) {
+  if (!onCommitCode && !onRedoCommit && !onPushCode) {
+    return null;
+  }
+
+  const isCommiting = actionKey === `commit-${run.id}`;
+  const isRedoing = record ? actionKey === `redo-${record.id}` : false;
+  const isPushing = record ? actionKey === `push-${record.id}` : false;
+  const isBusy = isCommiting || isRedoing || isPushing;
+  const hasLocalPath = !!run.localPath?.trim();
+  const commitCount = records.length;
+  const pushCount = records.filter((item) => item.status === 'pushed' && item.pushedAt).length;
+  const latestRecord = records[0] ?? null;
+  const statusTone =
+    record?.status === 'pushed'
+      ? 'success'
+      : record?.status === 'needs_push'
+        ? 'warning'
+        : 'neutral';
+  const statusLabel =
+    record?.status === 'pushed'
+      ? '已推送'
+      : record?.status === 'needs_push'
+        ? '待重新推送'
+        : record
+          ? '本地已提交'
+          : latestRecord
+            ? '新 session 未提交'
+          : '未提交';
+  const shortSha = record?.commitSha ? record.commitSha.slice(0, 12) : '';
+
+  return (
+    <div className="w-full min-w-[220px] rounded-xl border border-zinc-800/70 bg-black/20 px-3 py-2 lg:w-72">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[10px] font-medium text-zinc-500">代码提交</span>
+        <WorkspaceBadge tone={statusTone}>{statusLabel}</WorkspaceBadge>
+      </div>
+      <div className="mt-1 flex items-center gap-2 text-[10px] text-zinc-500">
+        <span>提交 {commitCount} 次</span>
+        <span>推送 {pushCount} 次</span>
+      </div>
+
+      {record && (
+        <div className="mt-2 space-y-1 text-[11px] text-zinc-400">
+          <div className="flex items-center gap-1.5">
+            <span className="shrink-0 text-zinc-600">Repo</span>
+            {record.repoUrl ? (
+              <a
+                href={record.repoUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="min-w-0 truncate font-mono text-zinc-300 transition hover:text-white"
+                title={record.repoUrl}
+              >
+                {record.repoName}
+              </a>
+            ) : (
+              <span className="min-w-0 truncate font-mono text-zinc-300">{record.repoName}</span>
+            )}
+          </div>
+          {record.commitSha && (
+            <div className="flex items-center gap-1.5">
+              <span className="shrink-0 text-zinc-600">SHA</span>
+              {record.commitUrl ? (
+                <a
+                  href={record.commitUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="font-mono text-zinc-300 transition hover:text-white"
+                  title={record.commitSha}
+                >
+                  {shortSha}
+                </a>
+              ) : (
+                <span className="font-mono text-zinc-300" title={record.commitSha}>
+                  {shortSha}
+                </span>
+              )}
+              <CopyIconButton
+                value={record.commitSha}
+                label="复制完整 commit SHA"
+                className="rounded p-0.5 text-zinc-500 transition hover:bg-zinc-800/50 hover:text-zinc-200"
+                iconClassName="h-3 w-3"
+              />
+            </div>
+          )}
+          {record.errorMessage && (
+            <div className="flex items-start gap-1.5 rounded-lg border border-red-500/20 bg-red-500/10 px-2 py-1.5 text-red-200">
+              <AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />
+              <span className="line-clamp-3 break-words" title={record.errorMessage}>
+                {record.errorMessage}
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+      {!record && latestRecord && (
+        <div className="mt-2 space-y-1 text-[11px] text-zinc-500">
+          <div className="flex items-center gap-1.5">
+            <span>上次提交</span>
+            <span className="font-mono text-zinc-400" title={latestRecord.commitSha}>
+              {latestRecord.commitSha ? latestRecord.commitSha.slice(0, 12) : '-'}
+            </span>
+          </div>
+          {currentSessionId && (
+            <p className="line-clamp-1" title={currentSessionId}>
+              当前 session 尚未提交
+            </p>
+          )}
+        </div>
+      )}
+
+      <div className="mt-2 flex flex-wrap gap-1.5">
+        {!record && (
+          <button
+            type="button"
+            disabled={!hasLocalPath || isBusy}
+            onClick={() => void onCommitCode?.(run)}
+            title={!hasLocalPath ? '需要先记录副本目录后才能提交代码' : undefined}
+            className="inline-flex items-center gap-1 rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-2 py-1 text-[11px] font-medium text-emerald-200 transition hover:bg-emerald-500/15 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {isCommiting ? <RefreshCw className="h-3 w-3 animate-spin" /> : <Check className="h-3 w-3" />}
+            {isCommiting ? '提交中…' : '提交代码'}
+          </button>
+        )}
+        {record && (
+          <>
+            <button
+              type="button"
+              disabled={isBusy}
+              onClick={() => void onRedoCommit?.(record)}
+              className="inline-flex items-center gap-1 rounded-lg border border-zinc-700/70 bg-zinc-900/70 px-2 py-1 text-[11px] font-medium text-zinc-200 transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {isRedoing ? <RefreshCw className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+              {isRedoing ? '重做中…' : '重做提交'}
+            </button>
+            <button
+              type="button"
+              disabled={isBusy}
+              onClick={() => void onPushCode?.(record)}
+              className="inline-flex items-center gap-1 rounded-lg border border-sky-500/25 bg-sky-500/10 px-2 py-1 text-[11px] font-medium text-sky-200 transition hover:bg-sky-500/15 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {isPushing ? <RefreshCw className="h-3 w-3 animate-spin" /> : <UploadCloud className="h-3 w-3" />}
+              {isPushing ? '推送中…' : record.status === 'pushed' ? '重新推送' : '推送 GitHub'}
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function WorkspaceBadge({
+  children,
+  tone,
+  className,
+}: {
+  children: React.ReactNode;
+  tone: 'neutral' | 'success' | 'warning' | 'danger' | 'purple' | 'blue';
+  className?: string;
+}) {
+  const tones: Record<string, string> = {
+    neutral: 'border-stone-200 bg-stone-100 text-stone-600 dark:border-zinc-700/70 dark:bg-zinc-900 dark:text-zinc-300',
+    success: 'border-emerald-500/20 bg-emerald-500/10 text-emerald-700 dark:text-emerald-200',
+    warning: 'border-amber-500/20 bg-amber-500/10 text-amber-700 dark:text-amber-200',
+    danger: 'border-red-500/20 bg-red-500/10 text-red-700 dark:text-red-200',
+    purple: 'border-indigo-500/20 bg-indigo-500/10 text-indigo-700 dark:text-indigo-200',
+    blue: 'border-sky-500/20 bg-sky-500/10 text-sky-700 dark:text-sky-200',
+  };
+
+  return (
+    <span className={clsx('inline-flex rounded-full border px-2 py-0.5 text-[10px] font-medium', tones[tone], className)}>
+      {children}
+    </span>
+  );
+}
+
+function PromptDifficultyBadge({
+  difficulty,
+}: {
+  difficulty: string | null | undefined;
+}) {
+  const normalized = normalizePromptDifficultyLabel(difficulty);
+  const tone =
+    normalized === '简单'
+      ? 'success'
+      : normalized === '困难'
+        ? 'warning'
+        : normalized === '地狱'
+          ? 'danger'
+          : 'blue';
+
+  return <WorkspaceBadge tone={tone}>难度：{normalized}</WorkspaceBadge>;
+}
+
+function normalizePromptDifficultyLabel(value: string | null | undefined) {
+  const trimmed = value?.trim();
+  if (trimmed === '简单' || trimmed === '困难' || trimmed === '地狱') {
+    return trimmed;
+  }
+  return '一般';
+}
+
+function SectionBlock({
+  icon: Icon,
+  title,
+  description,
+  badge,
+  children,
+}: {
+  icon: React.ComponentType<{ className?: string }>;
+  title: string;
+  description: string;
+  badge?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="space-y-3 rounded-[24px] border border-stone-200 bg-white/60 p-4 sm:p-5 dark:border-zinc-800/70 dark:bg-zinc-900/35">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 text-sm font-medium text-stone-800 dark:text-zinc-100">
+            <Icon className="h-4 w-4 text-indigo-400" />
+            {title}
+          </div>
+          <p className="mt-1 text-xs leading-5 text-stone-600 dark:text-zinc-500">{description}</p>
+        </div>
+        {badge}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function InfoTile({
+  label,
+  children,
+  mono,
+}: {
+  label: string;
+  children: React.ReactNode;
+  mono?: boolean;
+}) {
+  return (
+    <div className="rounded-2xl border border-stone-200 bg-white/60 px-4 py-3 dark:border-zinc-800/70 dark:bg-zinc-900/40">
+      <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-stone-500 dark:text-zinc-500">{label}</p>
+      <div className={clsx('mt-2 break-all text-sm text-stone-800 dark:text-zinc-200', mono && 'font-mono text-xs leading-6')}>{children}</div>
+    </div>
+  );
+}
+
+function FieldLabel({ label }: { label: string }) {
+  return <span className="block text-[11px] font-medium text-zinc-500">{label}</span>;
+}
+
+function StatusBanner({
+  children,
+  tone,
+}: {
+  children: React.ReactNode;
+  tone: 'warning' | 'danger';
+}) {
+  return (
+    <div className={clsx(
+      'rounded-2xl border px-4 py-3 text-xs',
+      tone === 'warning'
+        ? 'border-amber-500/20 bg-amber-500/10 text-amber-700 dark:text-amber-200'
+        : 'border-red-500/20 bg-red-500/10 text-red-700 dark:text-red-200',
+    )}>
+      {children}
+    </div>
+  );
+}
+
+function SessionSwitchCard({
+  label,
+  description,
+  checked,
+  disabled,
+  onChange,
+  onLabel,
+  offLabel,
+  tone,
+}: {
+  label: string;
+  description: string;
+  checked: boolean;
+  disabled?: boolean;
+  onChange: (checked: boolean) => void;
+  onLabel: string;
+  offLabel: string;
+  tone: 'indigo' | 'emerald';
+}) {
+  const activeTone =
+    tone === 'emerald'
+      ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-100'
+      : 'border-indigo-500/20 bg-indigo-500/10 text-indigo-100';
+  const trackTone = tone === 'emerald' ? 'bg-emerald-500' : 'bg-indigo-500';
+
+  return (
+    <div className={clsx(
+      'flex items-center justify-between gap-3 rounded-2xl border px-3 py-3 transition',
+      checked ? activeTone : 'border-zinc-800 bg-black/20 text-zinc-300',
+      disabled && 'opacity-60',
+    )}>
+      <div className="min-w-0">
+        <p className="text-xs font-semibold">{label}</p>
+        <div className="mt-1 flex flex-wrap items-center gap-2">
+          <WorkspaceBadge tone={checked ? tone === 'emerald' ? 'success' : 'purple' : 'neutral'}>
+            {checked ? onLabel : offLabel}
+          </WorkspaceBadge>
+          <p className="text-[10px] leading-5 text-zinc-500">{description}</p>
+        </div>
+      </div>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={checked}
+        aria-label={label}
+        disabled={disabled}
+        onClick={() => onChange(!checked)}
+        className={clsx(
+          'relative inline-flex h-6 w-11 flex-shrink-0 items-center rounded-full transition',
+          checked ? trackTone : 'bg-zinc-700',
+        )}
+      >
+        <span
+          className={clsx(
+            'inline-block h-5 w-5 rounded-full bg-white shadow-sm transition-transform',
+            checked ? 'translate-x-5' : 'translate-x-0.5',
+          )}
+        />
+      </button>
+    </div>
+  );
+}
+
+function BinaryChoiceGroup({
+  title,
+  value,
+  positiveLabel,
+  negativeLabel,
+  onPositive,
+  onNegative,
+}: {
+  title: string;
+  value: boolean;
+  positiveLabel: string;
+  negativeLabel: string;
+  onPositive: () => void;
+  onNegative: () => void;
+}) {
+  return (
+    <div className="flex flex-col gap-2 rounded-2xl border border-zinc-800/70 bg-black/20 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+      <div>
+        <p className="text-xs font-semibold text-zinc-200">{title}</p>
+        <p className="mt-1 text-[11px] text-zinc-500">用更明确的判断替代模糊备注。</p>
+      </div>
+      <div className="inline-flex rounded-xl border border-zinc-800 bg-zinc-900/80 p-1">
+        <button
+          type="button"
+          onClick={onPositive}
+          className={clsx(
+            'rounded-lg px-3 py-1.5 text-xs font-medium transition',
+            value ? 'bg-emerald-500/20 text-emerald-200' : 'text-zinc-500 hover:text-zinc-200',
+          )}
+        >
+          {positiveLabel}
+        </button>
+        <button
+          type="button"
+          onClick={onNegative}
+          className={clsx(
+            'rounded-lg px-3 py-1.5 text-xs font-medium transition',
+            !value ? 'bg-red-500/20 text-red-200' : 'text-zinc-500 hover:text-zinc-200',
+          )}
+        >
+          {negativeLabel}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function AiReviewDecisionBadge({
+  label,
+  value,
+}: {
+  label: string;
+  value: boolean | null;
+}) {
+  if (value === null) {
+    return <WorkspaceBadge tone="neutral">{label}：未记录</WorkspaceBadge>;
+  }
+
+  return (
+    <WorkspaceBadge tone={value ? 'success' : 'danger'}>
+      {label}：{value ? '是' : '否'}
+    </WorkspaceBadge>
+  );
+}
+
+function AiReviewTextCard({
+  title,
+  value,
+  copyLabel,
+  tone,
+}: {
+  title: string;
+  value: string;
+  copyLabel: string;
+  tone: 'warning' | 'indigo';
+}) {
+  const styles = tone === 'warning'
+    ? {
+      panel: 'border-amber-500/20 bg-amber-500/10',
+      title: 'text-amber-300',
+      text: 'text-amber-100',
+      button:
+        'border-amber-500/20 bg-amber-500/10 text-amber-200 hover:border-amber-400/40 hover:bg-amber-500/15 hover:text-amber-100',
+    }
+    : {
+      panel: 'border-indigo-500/20 bg-indigo-500/10',
+      title: 'text-indigo-300',
+      text: 'text-indigo-100',
+      button:
+        'border-indigo-500/20 bg-indigo-500/10 text-indigo-200 hover:border-indigo-400/40 hover:bg-indigo-500/15 hover:text-indigo-100',
+    };
+
+  return (
+    <div className={clsx('rounded-2xl border px-4 py-3', styles.panel)}>
+      <div className="flex items-center justify-between gap-3">
+        <p className={clsx('text-[10px] font-semibold uppercase tracking-[0.22em]', styles.title)}>
+          {title}
+        </p>
+        <CopyIconButton
+          value={value}
+          label={copyLabel}
+          className={clsx(
+            'inline-flex h-7 w-7 items-center justify-center rounded-lg transition',
+            styles.button,
+          )}
+          iconClassName="h-3.5 w-3.5"
+        />
+      </div>
+      <p className={clsx('mt-2 text-sm leading-6', styles.text)}>{value}</p>
+    </div>
+  );
+}
+
+function taskStatusTone(status: TaskStatus) {
+  switch (status) {
+    case 'Claimed':
+      return 'border-blue-500/20 bg-blue-500/10 text-blue-700 dark:text-blue-200';
+    case 'Downloading':
+      return 'border-amber-500/20 bg-amber-500/10 text-amber-700 dark:text-amber-200';
+    case 'Downloaded':
+      return 'border-stone-300 bg-stone-100 text-stone-700 dark:border-zinc-700/70 dark:bg-zinc-900 dark:text-zinc-200';
+    case 'PromptReady':
+      return 'border-indigo-500/20 bg-indigo-500/10 text-indigo-700 dark:text-indigo-200';
+    case 'ExecutionCompleted':
+      return 'border-cyan-500/20 bg-cyan-500/10 text-cyan-700 dark:text-cyan-200';
+    case 'Submitted':
+      return 'border-emerald-500/20 bg-emerald-500/10 text-emerald-700 dark:text-emerald-200';
+    case 'Error':
+      return 'border-red-500/20 bg-red-500/10 text-red-700 dark:text-red-200';
+    default:
+      return 'border-stone-300 bg-stone-100 text-stone-700 dark:border-zinc-700/70 dark:bg-zinc-900 dark:text-zinc-200';
+  }
+}
+
+function promptStatusTone(status: PromptGenerationStatus) {
+  switch (status) {
+    case 'running':
+      return 'border border-amber-500/20 bg-amber-500/10 text-amber-700 dark:text-amber-200';
+    case 'done':
+      return 'border border-emerald-500/20 bg-emerald-500/10 text-emerald-700 dark:text-emerald-200';
+    case 'error':
+      return 'border border-red-500/20 bg-red-500/10 text-red-700 dark:text-red-200';
+    default:
+      return 'border border-stone-300 bg-stone-100 text-stone-700 dark:border-zinc-700/70 dark:bg-zinc-900 dark:text-zinc-300';
+  }
+}
+
+function isOriginModel(modelName: string) {
+  return modelName.trim().toUpperCase() === 'ORIGIN';
+}
+
+function isSourceModel(modelName: string, sourceModelName: string) {
+  return modelName.trim().toUpperCase() === sourceModelName.trim().toUpperCase();
+}
+
+function isEditableTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+  if (target.isContentEditable) {
+    return true;
+  }
+
+  const tag = target.tagName.toLowerCase();
+  return tag === 'input' || tag === 'textarea' || tag === 'select';
+}
+
+function isNonExecutionModel(modelName: string, sourceModelName: string) {
+  return isOriginModel(modelName) || isSourceModel(modelName, sourceModelName);
+}
+
+function resolveModelRunCodeLink(run: ModelRunFromDB, sourceModelName: string) {
+  if (isSourceModel(run.modelName, sourceModelName)) {
+    return {
+      label: '源代码地址',
+      url: run.originUrl ?? run.prUrl ?? null,
+    };
+  }
+
+  return {
+    label: '代码地址',
+    url: run.prUrl,
+  };
+}
+
+function trimToNull(value: string | null | undefined) {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : null;
+}
+
+function inferNextPromptTaskType(prompt: string | null | undefined): string {
+  const text = prompt?.trim().toLowerCase() ?? '';
+  if (!text || text === '无') return '未归类';
+  if (text.includes('测试') || text.includes('用例') || text.includes('覆盖率') || text.includes('断言')) {
+    return '代码测试';
+  }
+  if (text.includes('重构') || text.includes('拆分') || text.includes('抽取') || text.includes('简化结构')) {
+    return '代码重构';
+  }
+  if (text.includes('工程化') || text.includes('构建') || text.includes('脚手架') || text.includes('ci') || text.includes('配置')) {
+    return '工程化';
+  }
+  if (text.includes('理解') || text.includes('说明') || text.includes('梳理') || text.includes('文档')) {
+    return '代码理解';
+  }
+  if (text.includes('从零') || text.includes('0-1') || text.includes('全新') || text.includes('完整')) {
+    return '0-1代码生成';
+  }
+  if (text.includes('新增') || text.includes('增加') || text.includes('支持') || text.includes('补充') || text.includes('补齐')) {
+    return 'Feature迭代';
+  }
+  if (text.includes('修复') || text.includes('问题') || text.includes('错误') || text.includes('异常') || text.includes('不正确') || text.includes('失败')) {
+    return 'Bug修复';
+  }
+  return 'Bug修复';
+}
+
+function normalizeNextPromptTaskType(taskType: string | null | undefined, fallbackPrompt?: string | null): string {
+  const normalized = normalizeTaskTypeName(taskType ?? '');
+  if (normalized) return normalized;
+  return inferNextPromptTaskType(fallbackPrompt);
+}
+
+function basenameOrFallback(path: string | null, fallback: string) {
+  if (!path) {
+    return fallback;
+  }
+  const normalized = path.replace(/\/+$/, '');
+  const parts = normalized.split('/');
+  return parts[parts.length - 1] || fallback;
+}
+
+function parseAiReviewPayload(raw: string | null | undefined): AiReviewPayload | null {
+  const text = trimToNull(raw);
+  if (!text) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(text) as Partial<AiReviewPayload>;
+    const anyParsed = parsed as Record<string, unknown>;
+    return {
+      reviewRoundId: typeof anyParsed.reviewRoundId === 'string' ? anyParsed.reviewRoundId : (typeof anyParsed.reviewNodeId === 'string' ? anyParsed.reviewNodeId : null),
+      modelRunId: parsed.modelRunId ?? null,
+      modelName: typeof parsed.modelName === 'string' ? parsed.modelName : '',
+      localPath: typeof parsed.localPath === 'string' ? parsed.localPath : '',
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseAiReviewResult(raw: string | null | undefined): AiReviewResult | null {
+  const text = trimToNull(raw);
+  if (!text) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(text) as Partial<AiReviewResult>;
+    if (
+      (parsed.reviewStatus !== 'pass' && parsed.reviewStatus !== 'warning') ||
+      typeof parsed.modelName !== 'string'
+    ) {
+      return null;
+    }
+    const anyResult = parsed as Record<string, unknown>;
+    return {
+      reviewRoundId: typeof anyResult.reviewRoundId === 'string' ? anyResult.reviewRoundId : (typeof anyResult.reviewNodeId === 'string' ? anyResult.reviewNodeId : ''),
+      modelRunId: typeof parsed.modelRunId === 'string' ? parsed.modelRunId : '',
+      modelName: parsed.modelName,
+      promptDifficulty: typeof parsed.promptDifficulty === 'string' ? parsed.promptDifficulty : undefined,
+      reviewStatus: parsed.reviewStatus,
+      reviewRound: typeof parsed.reviewRound === 'number' ? parsed.reviewRound : 0,
+      reviewNotes: typeof parsed.reviewNotes === 'string' ? parsed.reviewNotes : '',
+      dissatisfactionSummary:
+        typeof parsed.dissatisfactionSummary === 'string' ? parsed.dissatisfactionSummary : undefined,
+      nextPrompt: typeof parsed.nextPrompt === 'string' ? parsed.nextPrompt : '',
+      nextPromptTaskType: typeof parsed.nextPromptTaskType === 'string' ? parsed.nextPromptTaskType : undefined,
+      isCompleted: typeof parsed.isCompleted === 'boolean' ? parsed.isCompleted : undefined,
+      isSatisfied: typeof parsed.isSatisfied === 'boolean' ? parsed.isSatisfied : undefined,
+      projectType: typeof parsed.projectType === 'string' ? parsed.projectType : undefined,
+      changeScope: typeof parsed.changeScope === 'string' ? parsed.changeScope : undefined,
+      keyLocations: typeof parsed.keyLocations === 'string' ? parsed.keyLocations : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function extractAiReviewDetailsFromResult(
+  result: AiReviewResult | null | undefined,
+): AiReviewStructuredDetails | null {
+  if (!result) {
+    return null;
+  }
+
+  const details: AiReviewStructuredDetails = {
+    isCompleted: typeof result.isCompleted === 'boolean' ? result.isCompleted : null,
+    isSatisfied: typeof result.isSatisfied === 'boolean' ? result.isSatisfied : null,
+    projectType: trimToNull(result.projectType),
+    changeScope: trimToNull(result.changeScope),
+    keyLocations: trimToNull(result.keyLocations),
+  };
+
+  return hasAiReviewDetails(details) ? details : null;
+}
+
+function parseAiReviewProgressDetails(
+  raw: string | null | undefined,
+): AiReviewStructuredDetails | null {
+  const text = trimToNull(raw);
+  if (!text) {
+    return null;
+  }
+
+  const jsonStart = text.indexOf('{');
+  if (jsonStart < 0) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(text.slice(jsonStart)) as Partial<AiReviewResult>;
+    return extractAiReviewDetailsFromResult({
+      reviewRoundId: typeof parsed.reviewRoundId === 'string' ? parsed.reviewRoundId : '',
+      modelRunId: typeof parsed.modelRunId === 'string' ? parsed.modelRunId : '',
+      modelName: typeof parsed.modelName === 'string' ? parsed.modelName : '',
+      promptDifficulty: typeof parsed.promptDifficulty === 'string' ? parsed.promptDifficulty : undefined,
+      reviewStatus: parsed.reviewStatus === 'pass' || parsed.reviewStatus === 'warning' ? parsed.reviewStatus : 'warning',
+      reviewRound: typeof parsed.reviewRound === 'number' ? parsed.reviewRound : 0,
+      reviewNotes: typeof parsed.reviewNotes === 'string' ? parsed.reviewNotes : '',
+      dissatisfactionSummary:
+        typeof parsed.dissatisfactionSummary === 'string' ? parsed.dissatisfactionSummary : undefined,
+      nextPrompt: typeof parsed.nextPrompt === 'string' ? parsed.nextPrompt : '',
+      nextPromptTaskType: typeof parsed.nextPromptTaskType === 'string' ? parsed.nextPromptTaskType : undefined,
+      isCompleted: typeof parsed.isCompleted === 'boolean' ? parsed.isCompleted : undefined,
+      isSatisfied: typeof parsed.isSatisfied === 'boolean' ? parsed.isSatisfied : undefined,
+      projectType: typeof parsed.projectType === 'string' ? parsed.projectType : undefined,
+      changeScope: typeof parsed.changeScope === 'string' ? parsed.changeScope : undefined,
+      keyLocations: typeof parsed.keyLocations === 'string' ? parsed.keyLocations : undefined,
+    });
+  } catch {
+    return null;
+  }
+}
+
+function hasAiReviewDetails(details: AiReviewStructuredDetails) {
+  return Boolean(
+    details.projectType ||
+      details.changeScope ||
+      details.keyLocations ||
+      details.isCompleted !== null ||
+      details.isSatisfied !== null,
+  );
+}
+
+function meaningfulAiReviewText(value: string | null | undefined) {
+  const trimmed = trimToNull(value);
+  if (!trimmed || trimmed === '无') {
+    return null;
+  }
+  return trimmed;
+}
+
+function buildAiReviewKey(modelRunId: string | null | undefined, localPath: string | null | undefined) {
+  const normalizedRunId = trimToNull(modelRunId);
+  if (normalizedRunId) {
+    return `run:${normalizedRunId}`;
+  }
+  const normalizedPath = trimToNull(localPath);
+  if (normalizedPath) {
+    return `path:${normalizedPath}`;
+  }
+  return null;
+}
+
+function deriveReviewStatusFromJob(entry: ParsedAiReviewJob) {
+  if (entry.output?.reviewStatus === 'pass' || entry.output?.reviewStatus === 'warning') {
+    return entry.output.reviewStatus;
+  }
+  if (entry.job.status === 'running' || entry.job.status === 'pending') {
+    return 'running';
+  }
+  if (entry.job.status === 'error') {
+    return 'warning';
+  }
+  return 'none';
+}
+
+function backgroundJobStatusPresentation(status: BackgroundJob['status']) {
+  switch (status) {
+    case 'pending':
+      return { label: '排队中', tone: 'neutral' as const };
+    case 'running':
+      return { label: '执行中', tone: 'purple' as const };
+    case 'done':
+      return { label: '已完成', tone: 'success' as const };
+    case 'error':
+      return { label: '失败', tone: 'danger' as const };
+    case 'cancelled':
+      return { label: '已取消', tone: 'warning' as const };
+    default:
+      return { label: status, tone: 'neutral' as const };
+  }
+}
+
+function formatAiReviewTimestamp(timestamp: number | null | undefined) {
+  if (!timestamp) {
+    return '未记录';
+  }
+  return new Date(timestamp * 1000).toLocaleString('zh-CN');
+}
+
+function reviewStatusPresentation(reviewStatus: string, reviewRound: number) {
+  if (reviewStatus === 'running') {
+    return {
+      label: `复审中（第 ${reviewRound} 轮）`,
+      icon: '↻',
+      badgeCls: 'border border-violet-500/20 bg-violet-500/10 text-violet-300',
+    };
+  }
+  if (reviewStatus === 'pass') {
+    return {
+      label: `复审通过（第 ${reviewRound} 轮）`,
+      icon: '✓',
+      badgeCls: 'border border-emerald-500/20 bg-emerald-500/10 text-emerald-300',
+    };
+  }
+  if (reviewStatus === 'warning') {
+    return {
+      label: `复审未通过（${reviewRound} 轮）`,
+      icon: '⚠',
+      badgeCls: 'border border-amber-500/30 bg-amber-500/10 text-amber-300',
+    };
+  }
+  return { label: '', icon: '', badgeCls: '' };
+}
+
+function modelRunPresentation(status: string) {
+  if (status === 'done') {
+    return {
+      label: '完成',
+      icon: CheckCircle2,
+      iconCls: 'text-emerald-400',
+      badgeCls: 'border border-emerald-500/20 bg-emerald-500/10 text-emerald-200',
+    };
+  }
+  if (status === 'running') {
+    return {
+      label: '执行中',
+      icon: PlayCircle,
+      iconCls: 'text-amber-400',
+      badgeCls: 'border border-amber-500/20 bg-amber-500/10 text-amber-200',
+    };
+  }
+  if (status === 'error') {
+    return {
+      label: '异常',
+      icon: X,
+      iconCls: 'text-red-400',
+      badgeCls: 'border border-red-500/20 bg-red-500/10 text-red-200',
+    };
+  }
+  return {
+    label: '待处理',
+    icon: CircleDashed,
+    iconCls: 'text-stone-400 dark:text-zinc-500',
+    badgeCls: 'border border-stone-300 bg-stone-100 text-stone-700 dark:border-zinc-700/70 dark:bg-zinc-900 dark:text-zinc-300',
+  };
+}
+
+// 自定义任务类型下拉
+function TaskTypeSelect({
+  value,
+  options,
+  disabled,
+  selected: isSelectedCard,
+  onChange,
+  onClick,
+}: {
+  value: string;
+  options: { value: string; label: string }[];
+  disabled?: boolean;
+  selected: boolean;
+  onChange: (value: string) => void;
+  onClick?: (e: React.MouseEvent) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [menuStyle, setMenuStyle] = useState<React.CSSProperties>({});
+
+  const currentLabel = options.find((o) => o.value === value)?.label ?? value;
+
+  const handleToggle = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    onClick?.(e);
+    if (disabled) return;
+    if (!open && containerRef.current) {
+      const rect = containerRef.current.getBoundingClientRect();
+      const spaceBelow = window.innerHeight - rect.bottom;
+      const menuH = Math.min(options.length * 32 + 8, 240);
+      if (spaceBelow >= menuH || spaceBelow >= 120) {
+        setMenuStyle({ top: rect.bottom + 4, left: rect.left, minWidth: rect.width });
+      } else {
+        setMenuStyle({ bottom: window.innerHeight - rect.top + 4, left: rect.left, minWidth: rect.width });
+      }
+    }
+    setOpen((v) => !v);
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => {
+      if (!containerRef.current?.contains(e.target as Node) && !menuRef.current?.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [open]);
+
+  return (
+    <div ref={containerRef} className="relative min-w-0 flex-1">
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={handleToggle}
+        className={clsx(
+          'flex w-full items-center justify-between gap-1 rounded-lg border px-2.5 py-1.5 text-[10px] font-medium outline-none transition',
+          disabled
+            ? 'cursor-default border-indigo-500/30 bg-indigo-500/10 text-indigo-400 opacity-70'
+            : isSelectedCard
+            ? 'border-indigo-500/40 bg-indigo-500/15 text-indigo-200 hover:bg-indigo-500/25'
+            : 'border-stone-200 bg-stone-50 text-stone-700 hover:bg-stone-100 dark:border-zinc-700/70 dark:bg-zinc-900/80 dark:text-zinc-300 dark:hover:bg-zinc-800',
+        )}
+      >
+        <span className="truncate">{currentLabel}</span>
+        <ChevronDown className={clsx('h-3 w-3 shrink-0 transition-transform', open && 'rotate-180', isSelectedCard ? 'text-indigo-400' : 'text-stone-400 dark:text-zinc-500')} />
+      </button>
+
+      <AnimatePresence>
+        {open && (
+          <motion.div
+            ref={menuRef}
+            initial={{ opacity: 0, y: -4 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -4 }}
+            transition={{ duration: 0.12 }}
+            className="fixed z-50 overflow-y-auto rounded-xl border border-zinc-700/80 bg-zinc-900 py-1 shadow-2xl"
+            style={{ ...menuStyle, maxHeight: 240 }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            {options.map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onChange(opt.value);
+                  setOpen(false);
+                }}
+                className={clsx(
+                  'flex w-full items-center gap-2 px-3 py-1.5 text-[11px] transition',
+                  opt.value === value
+                    ? 'bg-indigo-500/20 text-indigo-300'
+                    : 'text-zinc-300 hover:bg-zinc-800 hover:text-white',
+                )}
+              >
+                {opt.value === value && <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-indigo-400" />}
+                <span className={opt.value === value ? '' : 'ml-3.5'}>{opt.label}</span>
+              </button>
+            ))}
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+// Tooltip 组件
+function Tooltip({
+  content,
+  children,
+}: {
+  content: string;
+  children: React.ReactElement<{ onMouseEnter?: () => void; onMouseLeave?: () => void }>;
+}) {
+  const [isVisible, setIsVisible] = useState(false);
+  const [position, setPosition] = useState({ top: 0, left: 0 });
+  const childRef = useRef<HTMLDivElement>(null);
+  const timeoutRef = useRef<NodeJS.Timeout>();
+
+  const handleMouseEnter = () => {
+    clearTimeout(timeoutRef.current);
+    timeoutRef.current = setTimeout(() => {
+      if (childRef.current) {
+        const rect = childRef.current.getBoundingClientRect();
+        setPosition({
+          top: rect.bottom + 8,
+          left: rect.left + rect.width / 2,
+        });
+        setIsVisible(true);
+      }
+    }, 300);
+  };
+
+  const handleMouseLeave = () => {
+    clearTimeout(timeoutRef.current);
+    setIsVisible(false);
+  };
+
+  const clonedChild = React.cloneElement(children, {
+    ref: childRef as any,
+    onMouseEnter: () => {
+      handleMouseEnter();
+      children.props.onMouseEnter?.();
+    },
+    onMouseLeave: () => {
+      handleMouseLeave();
+      children.props.onMouseLeave?.();
+    },
+  });
+
+  return (
+    <>
+      {clonedChild}
+      <AnimatePresence>
+        {isVisible && (
+          <motion.div
+            initial={{ opacity: 0, y: 4 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 4 }}
+            transition={{ duration: 0.15 }}
+            className="fixed z-50 max-w-xs rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs text-stone-700 shadow-lg dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
+            style={{
+              top: `${position.top}px`,
+              left: `${position.left}px`,
+              transform: 'translateX(-50%)',
+            }}
+          >
+            {content}
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </>
+  );
+}

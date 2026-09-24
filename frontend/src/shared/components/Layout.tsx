@@ -1,0 +1,1223 @@
+import { Outlet, NavLink, useLocation, useNavigate } from 'react-router-dom';
+import {
+  AlertCircle,
+  BarChart3,
+  Check,
+  ChevronDown,
+  CopyPlus,
+  Container,
+  FolderDown,
+  FolderOpen,
+  GitPullRequest,
+  Home,
+  Loader2,
+  Plus,
+  Settings,
+  Terminal,
+  Trash2,
+  X,
+} from 'lucide-react';
+import { Dialogs } from '@wailsio/runtime';
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import BackgroundJobPanel from './BackgroundJobPanel';
+import TaskTypeQuotaEditor from './TaskTypeQuotaEditor';
+import { useAppStore } from '../../store';
+import { inspectDirectory } from '../../api/git';
+import {
+  createNewProjectTaskSettings,
+  createProject,
+  createProjectBatch,
+  deleteProject,
+  getProjectTaskSettings,
+  getProjects,
+  serializeProjectModels,
+  serializeProjectTaskSettings,
+  setActiveProjectId,
+  type ProjectConfig,
+  type TaskTypeQuotas,
+} from '../../api/config';
+import {
+  clampSidebarWidth,
+  computeSidebarBaseWidthPx,
+  parseStoredSidebarWidth,
+  SIDEBAR_MIN_WIDTH_PX,
+  SIDEBAR_MAX_WIDTH_PX,
+  SIDEBAR_WIDTH_STORAGE_KEY,
+} from '../lib/layoutSizing';
+import {
+  MsgDirNotExist,
+  MsgPathNotDir,
+  MsgDirNotEmpty,
+  MsgSourceRepoFormat,
+  MsgOriginRequired,
+  MsgSourceModelInList,
+} from '../constants/messages';
+
+const NAV_ITEMS: Array<{ to: string; label: string; icon: typeof FolderDown; end?: boolean }> = [
+  { to: '/', icon: Home, label: '主页', end: true },
+  { to: '/claim', icon: FolderDown, label: '领题' },
+  { to: '/overview', icon: BarChart3, label: '项目查看' },
+  { to: '/annotation', icon: Container, label: '容器标注' },
+  { to: '/submit', icon: GitPullRequest, label: '提交' },
+];
+
+type ModelEntry = {
+  id: string;
+  name: string;
+};
+
+type ProjectFormState = {
+  name: string;
+  basePath: string;
+  defaultSubmitRepo: string;
+  sourceModelFolder: string;
+  overviewMarkdown: string;
+};
+
+const DEFAULT_MODELS: ModelEntry[] = [
+  { id: 'ORIGIN', name: 'ORIGIN' },
+  { id: 'cotv21-pro', name: 'cotv21-pro' },
+  { id: 'cotv21.2-pro', name: 'cotv21.2-pro' },
+];
+
+const PROJECT_MENU_MIN_WIDTH_EM = 5;
+const PROJECT_MENU_MAX_NAME_WIDTH_EM = 15;
+const PROJECT_MENU_CHROME_WIDTH_REM = 4.25;
+const PROJECT_MENU_ACTIONS_WIDTH_REM = 13;
+
+function isEditableTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
+  const tag = target.tagName.toLowerCase();
+  return tag === 'input' || tag === 'textarea' || tag === 'select';
+}
+
+function createEmptyProjectForm(): ProjectFormState {
+  return {
+    name: '',
+    basePath: '',
+    defaultSubmitRepo: '',
+    sourceModelFolder: 'ORIGIN',
+    overviewMarkdown: '',
+  };
+}
+
+function createBatchProjectName(projectName: string) {
+  const trimmedName = projectName.trim() || '新项目';
+  const now = new Date();
+  const datePart = [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, '0'),
+    String(now.getDate()).padStart(2, '0'),
+  ].join('-');
+  const timePart = [
+    String(now.getHours()).padStart(2, '0'),
+    String(now.getMinutes()).padStart(2, '0'),
+  ].join(':');
+  return `${trimmedName} ${datePart} ${timePart}`;
+}
+
+function parseProjectModels(models: string) {
+  try {
+    const parsed = JSON.parse(models) as unknown;
+    if (Array.isArray(parsed)) {
+      const normalized = parsed
+        .map((item) => normalizeModelName(String(item)))
+        .filter(Boolean);
+      return normalized.length > 0 ? normalized : ['ORIGIN'];
+    }
+  } catch {
+    // Fall through to comma/newline parsing for legacy project configs.
+  }
+
+  const normalized = models
+    .split(/[,\n]/)
+    .map((item) => normalizeModelName(item))
+    .filter(Boolean);
+  return normalized.length > 0 ? normalized : ['ORIGIN'];
+}
+
+function createModelEntries(models: string[]) {
+  const seen = new Set<string>();
+  const entries: ModelEntry[] = [];
+  for (const model of models) {
+    const normalized = normalizeModelName(model);
+    if (!normalized || seen.has(normalized.toLowerCase())) continue;
+    seen.add(normalized.toLowerCase());
+    entries.push({ id: normalized, name: normalized });
+  }
+  if (!entries.some((entry) => isOriginModel(entry.name))) {
+    entries.unshift({ id: 'ORIGIN', name: 'ORIGIN' });
+  }
+  return entries;
+}
+
+function normalizeModelName(name: string) {
+  const trimmed = name.trim();
+  if (!trimmed) return '';
+  return trimmed.toUpperCase() === 'ORIGIN' ? 'ORIGIN' : trimmed;
+}
+
+function isOriginModel(name: string) {
+  return normalizeModelName(name) === 'ORIGIN';
+}
+
+function measureProjectNameWidth(text: string) {
+  return Array.from(text.trim()).reduce((width, char) => width + (char.charCodeAt(0) > 255 ? 1 : 0.55), 0);
+}
+
+async function ensureEmptyProjectDirectory(path: string) {
+  const inspection = await inspectDirectory(path);
+  if (!inspection.exists) {
+    throw new Error(MsgDirNotExist);
+  }
+  if (!inspection.isDir) {
+    throw new Error(MsgPathNotDir);
+  }
+  if (!inspection.isEmpty) {
+    throw new Error(MsgDirNotEmpty);
+  }
+  return inspection;
+}
+
+export default function Layout() {
+  const theme = useAppStore((s) => s.theme);
+  const activeProject = useAppStore((s) => s.activeProject);
+  const loadActiveProject = useAppStore((s) => s.loadActiveProject);
+  const resetForNewProject = useAppStore((s) => s.resetForNewProject);
+
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  const [projects, setProjects] = useState<ProjectConfig[]>([]);
+  const [loadingProjects, setLoadingProjects] = useState(true);
+  const [showProjectMenu, setShowProjectMenu] = useState(false);
+  const [switchingProject, setSwitchingProject] = useState(false);
+  const [projectMenuError, setProjectMenuError] = useState('');
+  const [projectPendingDelete, setProjectPendingDelete] = useState<ProjectConfig | null>(null);
+  const [deletingProject, setDeletingProject] = useState(false);
+  const [deleteProjectError, setDeleteProjectError] = useState('');
+
+  const [showProjectModal, setShowProjectModal] = useState(false);
+  const [creatingProject, setCreatingProject] = useState(false);
+  const [pickingProjectDir, setPickingProjectDir] = useState(false);
+  const [projectError, setProjectError] = useState('');
+  const [projectForm, setProjectForm] = useState<ProjectFormState>(createEmptyProjectForm);
+  const [projectModalMode, setProjectModalMode] = useState<'create' | 'batch'>('create');
+  const [batchSourceProjectId, setBatchSourceProjectId] = useState('');
+  const [modelList, setModelList] = useState<ModelEntry[]>(DEFAULT_MODELS);
+  const [addingModel, setAddingModel] = useState(false);
+  const [newModelName, setNewModelName] = useState('');
+  const [taskTypes, setTaskTypes] = useState<string[]>(() => createNewProjectTaskSettings().taskTypes);
+  const [quotas, setQuotas] = useState<TaskTypeQuotas>(() => createNewProjectTaskSettings().quotas);
+  const [totals, setTotals] = useState<TaskTypeQuotas>(() => createNewProjectTaskSettings().totals);
+  const [sidebarWidthPx, setSidebarWidthPx] = useState<number | null>(null);
+  const [sidebarDragging, setSidebarDragging] = useState(false);
+
+  const projectMenuRef = useRef<HTMLDivElement>(null);
+  const sidebarRef = useRef<HTMLElement>(null);
+  const sidebarResizeStateRef = useRef<{ startX: number; startWidth: number } | null>(null);
+
+  const inputCls =
+    'w-full bg-stone-50 dark:bg-[#171B22] border border-stone-200 dark:border-[#232834] rounded-2xl px-4 py-2.5 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-slate-400/30 transition-shadow placeholder:text-stone-400';
+
+  const sourceModelOptions = useMemo(() => modelList.map((model) => model.name), [modelList]);
+  const projectMenuLabel = activeProject?.name ?? (loadingProjects ? '加载中...' : '未创建项目');
+  const projectNameWidth = useMemo(() => {
+    const widestName = [projectMenuLabel, ...projects.map((project) => project.name)]
+      .map((name) => measureProjectNameWidth(name))
+      .reduce((max, width) => Math.max(max, width), 0);
+    return Math.min(Math.max(widestName, PROJECT_MENU_MIN_WIDTH_EM), PROJECT_MENU_MAX_NAME_WIDTH_EM);
+  }, [projectMenuLabel, projects]);
+  const sidebarBaseWidthPx = useMemo(
+    () =>
+      computeSidebarBaseWidthPx(
+        projectNameWidth,
+        PROJECT_MENU_CHROME_WIDTH_REM + PROJECT_MENU_ACTIONS_WIDTH_REM + 2.5,
+      ),
+    [projectNameWidth],
+  );
+  const resolvedSidebarWidthPx = clampSidebarWidth(
+    sidebarWidthPx ?? (typeof window !== 'undefined' && window.innerWidth <= 1024 ? SIDEBAR_MIN_WIDTH_PX : sidebarBaseWidthPx),
+    SIDEBAR_MIN_WIDTH_PX,
+    SIDEBAR_MAX_WIDTH_PX,
+  );
+  const projectTriggerWidth = `calc(${projectNameWidth}em + ${PROJECT_MENU_CHROME_WIDTH_REM}rem)`;
+  const projectMenuWidth = `calc(${projectNameWidth}em + ${PROJECT_MENU_CHROME_WIDTH_REM + PROJECT_MENU_ACTIONS_WIDTH_REM}rem)`;
+  const sidebarWidth = `${resolvedSidebarWidthPx}px`;
+
+  const refreshProjects = async () => {
+    const nextProjects = await getProjects();
+    setProjects(nextProjects);
+  };
+
+  const resetProjectForm = () => {
+    setProjectForm(createEmptyProjectForm());
+    setModelList(DEFAULT_MODELS);
+    setAddingModel(false);
+    setNewModelName('');
+    const taskSettings = createNewProjectTaskSettings();
+    setTaskTypes(taskSettings.taskTypes);
+    setQuotas(taskSettings.quotas);
+    setTotals(taskSettings.totals);
+    setProjectError('');
+    setProjectModalMode('create');
+    setBatchSourceProjectId('');
+  };
+
+  const prepareBatchProjectForm = (project: ProjectConfig) => {
+    const modelNames = parseProjectModels(project.models);
+    const taskSettings = getProjectTaskSettings(project);
+
+    setProjectForm({
+      name: createBatchProjectName(project.name),
+      basePath: '',
+      defaultSubmitRepo: project.defaultSubmitRepo,
+      sourceModelFolder: project.sourceModelFolder || 'ORIGIN',
+      overviewMarkdown: project.overviewMarkdown,
+    });
+    setModelList(createModelEntries(modelNames));
+    setTaskTypes(taskSettings.taskTypes);
+    setQuotas(taskSettings.quotas);
+    setTotals(taskSettings.totals);
+    setAddingModel(false);
+    setNewModelName('');
+    setProjectError('');
+    setProjectModalMode('batch');
+    setBatchSourceProjectId(project.id);
+  };
+
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', theme === 'dark');
+  }, [theme]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    setSidebarWidthPx((currentWidth) => {
+      const persistedWidth = parseStoredSidebarWidth(
+        window.localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY),
+        SIDEBAR_MIN_WIDTH_PX,
+      );
+
+      if (currentWidth === null) {
+        const isSmallScreen = window.innerWidth <= 1024;
+        return persistedWidth ?? (isSmallScreen ? SIDEBAR_MIN_WIDTH_PX : sidebarBaseWidthPx);
+      }
+
+      return clampSidebarWidth(currentWidth, SIDEBAR_MIN_WIDTH_PX, SIDEBAR_MAX_WIDTH_PX);
+    });
+  }, [sidebarBaseWidthPx]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || sidebarWidthPx === null) return;
+    window.localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(sidebarWidthPx));
+  }, [sidebarWidthPx]);
+
+  useEffect(() => {
+    if (!activeProject) return;
+    setProjects((prev) =>
+      prev.some((project) => project.id === activeProject.id)
+        ? prev.map((project) => (project.id === activeProject.id ? { ...project, ...activeProject } : project))
+        : prev,
+    );
+  }, [activeProject]);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        await Promise.all([loadActiveProject(), refreshProjects()]);
+      } catch (error) {
+        setProjectMenuError(error instanceof Error ? error.message : '项目列表加载失败');
+      } finally {
+        setLoadingProjects(false);
+      }
+    })().catch(() => {
+      setLoadingProjects(false);
+    });
+  }, [loadActiveProject]);
+
+  useEffect(() => {
+    if (!showProjectMenu) return;
+    const handleOutsideClick = (event: MouseEvent) => {
+      if (projectMenuRef.current && !projectMenuRef.current.contains(event.target as Node)) {
+        setShowProjectMenu(false);
+      }
+    };
+
+    document.addEventListener('mousedown', handleOutsideClick);
+    return () => document.removeEventListener('mousedown', handleOutsideClick);
+  }, [showProjectMenu]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const meta = event.metaKey || event.ctrlKey;
+      if (!meta) return;
+
+      if (event.key === ',') {
+        event.preventDefault();
+        if (location.pathname !== '/settings') {
+          navigate('/settings');
+        }
+        return;
+      }
+
+      if (event.key.toLowerCase() === 'r') {
+        event.preventDefault();
+        window.location.reload();
+        return;
+      }
+
+      if (isEditableTarget(event.target)) return;
+
+      const routeMap: Record<string, string> = {
+        '1': '/',
+        '2': '/claim',
+        '3': '/overview',
+        '4': '/submit',
+      };
+
+      const nextRoute = routeMap[event.key];
+      if (nextRoute && location.pathname !== nextRoute) {
+        event.preventDefault();
+        navigate(nextRoute);
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [location.pathname, navigate]);
+
+  useEffect(() => {
+    if (!sidebarDragging) return;
+
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+
+    const handlePointerMove = (event: PointerEvent) => {
+      const resizeState = sidebarResizeStateRef.current;
+      if (!resizeState) return;
+
+      setSidebarWidthPx(
+        clampSidebarWidth(
+          resizeState.startWidth + event.clientX - resizeState.startX,
+          SIDEBAR_MIN_WIDTH_PX,
+          SIDEBAR_MAX_WIDTH_PX,
+        ),
+      );
+    };
+
+    const handlePointerUp = () => {
+      sidebarResizeStateRef.current = null;
+      setSidebarDragging(false);
+    };
+
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', handlePointerUp);
+
+    return () => {
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+    };
+  }, [sidebarDragging, sidebarBaseWidthPx]);
+
+  const handlePickProjectDirectory = async () => {
+    setPickingProjectDir(true);
+    setProjectError('');
+
+    let selectedPath = '';
+    try {
+      const result = await Dialogs.OpenFile({
+        CanChooseDirectories: true,
+        CanChooseFiles: false,
+        CanCreateDirectories: true,
+        ResolvesAliases: true,
+        Title: '选择项目目录',
+        Message: '请选择用于存放项目副本的目录',
+        ButtonText: '选择',
+        Directory: projectForm.basePath.trim() || undefined,
+      });
+
+      // Wails 在 Windows 非多选模式下应返回字符串，macOS/Linux 也是字符串。
+      // 但用户若选中 OneDrive 未同步、库文件夹、"这台电脑"等虚拟位置，
+      // Wails 底层 SIGDN_FILESYSPATH 可能返回空串或异常。
+      const picked = Array.isArray(result) ? result[0] ?? '' : result ?? '';
+      selectedPath = typeof picked === 'string' ? picked.trim() : '';
+    } catch (error) {
+      // 原始错误通常形如 "Dialog.OpenFile failed: error getting selection"，
+      // 对用户没意义，统一翻译成可操作的中文提示。
+      setProjectError(
+        '无法从所选位置获取文件路径（可能是 OneDrive 未同步目录、系统库或网络位置）。请改选本机真实目录，或直接在输入框粘贴完整路径。',
+      );
+      setPickingProjectDir(false);
+      return;
+    }
+
+    if (!selectedPath) {
+      // 点击取消不提示；但如果是 Wails 返回空串的异常场景，给一行提示，避免"点了没反应"。
+      setPickingProjectDir(false);
+      return;
+    }
+
+    try {
+      const inspection = await ensureEmptyProjectDirectory(selectedPath);
+      setProjectForm((prev) => ({
+        ...prev,
+        basePath: inspection.path,
+        name: inspection.name || prev.name,
+      }));
+    } catch (error) {
+      setProjectError(error instanceof Error ? error.message : '校验所选目录失败');
+    } finally {
+      setPickingProjectDir(false);
+    }
+  };
+
+  const handlePrLogoClick = () => {
+    navigate('/');
+  };
+
+  const handleSidebarResizeStart = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+
+    sidebarResizeStateRef.current = {
+      startX: event.clientX,
+      startWidth: sidebarRef.current?.getBoundingClientRect().width ?? resolvedSidebarWidthPx,
+    };
+    setSidebarDragging(true);
+    event.preventDefault();
+  };
+
+  const handleSidebarResizeReset = () => {
+    sidebarResizeStateRef.current = null;
+    setSidebarDragging(false);
+    setSidebarWidthPx(
+      typeof window !== 'undefined' && window.innerWidth <= 1024
+        ? SIDEBAR_MIN_WIDTH_PX
+        : sidebarBaseWidthPx,
+    );
+  };
+
+  const handleAddModel = () => {
+    const normalized = normalizeModelName(newModelName);
+    if (!normalized) return;
+    if (modelList.some((model) => model.id.toUpperCase() === normalized.toUpperCase())) {
+      return;
+    }
+
+    setModelList((prev) => [...prev, { id: normalized, name: normalized }]);
+    setNewModelName('');
+    setAddingModel(false);
+  };
+
+  const handleRemoveModel = (id: string) => {
+    if (isOriginModel(id)) return;
+
+    const nextModels = modelList.filter((model) => model.id !== id);
+    setModelList(nextModels);
+
+    if (normalizeModelName(projectForm.sourceModelFolder) === normalizeModelName(id)) {
+      const fallbackSource =
+        nextModels.find((model) => isOriginModel(model.name))?.name ?? nextModels[0]?.name ?? 'ORIGIN';
+      setProjectForm((prev) => ({ ...prev, sourceModelFolder: fallbackSource }));
+    }
+  };
+
+  const handleSwitchProject = async (project: ProjectConfig) => {
+    if (switchingProject) return;
+    if (project.id === activeProject?.id) {
+      setShowProjectMenu(false);
+      return;
+    }
+
+    setSwitchingProject(true);
+    setProjectMenuError('');
+    try {
+      await setActiveProjectId(project.id);
+      await resetForNewProject();
+      await refreshProjects();
+      setShowProjectMenu(false);
+      navigate('/');
+    } catch (error) {
+      setProjectMenuError(error instanceof Error ? error.message : '切换项目失败');
+    } finally {
+      setSwitchingProject(false);
+    }
+  };
+
+  const handleOpenDeleteProject = (project: ProjectConfig) => {
+    setDeleteProjectError('');
+    setProjectPendingDelete(project);
+    setShowProjectMenu(false);
+  };
+
+  const handleCloseDeleteProject = () => {
+    if (deletingProject) return;
+    setDeleteProjectError('');
+    setProjectPendingDelete(null);
+  };
+
+  const handleConfirmDeleteProject = async () => {
+    if (!projectPendingDelete || deletingProject) return;
+
+    const deletingActiveProject = projectPendingDelete.id === activeProject?.id;
+    const fallbackProject = projects.find((project) => project.id !== projectPendingDelete.id) ?? null;
+
+    setDeletingProject(true);
+    setDeleteProjectError('');
+
+    try {
+      await deleteProject(projectPendingDelete.id);
+
+      if (deletingActiveProject) {
+        await setActiveProjectId(fallbackProject?.id ?? '');
+        await Promise.all([resetForNewProject(), refreshProjects()]);
+        navigate('/');
+      } else {
+        await refreshProjects();
+      }
+
+      setProjectPendingDelete(null);
+    } catch (error) {
+      setDeleteProjectError(error instanceof Error ? error.message : '删除项目失败');
+    } finally {
+      setDeletingProject(false);
+    }
+  };
+
+  const handleCreateProject = async () => {
+    const name = projectForm.name.trim();
+    let cloneBasePath = '';
+    const normalizedModels = modelList
+      .map((model) => normalizeModelName(model.name))
+      .filter(Boolean);
+    const sourceModelFolder =
+      sourceModelOptions.find(
+        (model) => normalizeModelName(model) === normalizeModelName(projectForm.sourceModelFolder),
+      ) ?? 'ORIGIN';
+
+    if (!name) {
+      setProjectError('项目名称不能为空');
+      return;
+    }
+    if (projectModalMode === 'batch' && !batchSourceProjectId) {
+      setProjectError('缺少原项目配置，无法创建领题批次');
+      return;
+    }
+    if (!projectForm.basePath.trim()) {
+      setProjectError('请选择项目文件位置');
+      return;
+    }
+    try {
+      const inspection = await ensureEmptyProjectDirectory(projectForm.basePath.trim());
+      cloneBasePath = inspection.path;
+    } catch (error) {
+      setProjectError(error instanceof Error ? error.message : '项目目录校验失败');
+      return;
+    }
+    if (normalizedModels.length === 0) {
+      setProjectError('请至少配置一个模型');
+      return;
+    }
+    if (taskTypes.length === 0) {
+      setProjectError('请至少配置一个任务类型');
+      return;
+    }
+    if (projectForm.defaultSubmitRepo.trim() && !/^[^/\s]+\/[^/\s]+$/.test(projectForm.defaultSubmitRepo.trim())) {
+      setProjectError(MsgSourceRepoFormat);
+      return;
+    }
+    if (!normalizedModels.includes('ORIGIN')) {
+      setProjectError(MsgOriginRequired);
+      return;
+    }
+    if (!normalizedModels.some((model) => model.toUpperCase() === sourceModelFolder.toUpperCase())) {
+      setProjectError(MsgSourceModelInList);
+      return;
+    }
+
+    setCreatingProject(true);
+    setProjectError('');
+    try {
+      const serializedTaskSettings = serializeProjectTaskSettings(taskTypes, quotas, totals);
+      const nextProject: ProjectConfig = {
+        id: `project-${Date.now()}`,
+        name,
+        gitlabUrl: '',
+        gitlabToken: '',
+        hasGitLabToken: false,
+        cloneBasePath,
+        models: serializeProjectModels(normalizedModels),
+        sourceModelFolder,
+        defaultSubmitRepo: projectForm.defaultSubmitRepo.trim(),
+        questionBankProjectIds: '[]',
+        overviewMarkdown: projectForm.overviewMarkdown,
+        ...serializedTaskSettings,
+        createdAt: 0,
+        updatedAt: 0,
+      };
+
+      if (projectModalMode === 'batch') {
+        await createProjectBatch(batchSourceProjectId, nextProject);
+      } else {
+        await createProject(nextProject);
+      }
+      await setActiveProjectId(nextProject.id);
+      await resetForNewProject();
+      await refreshProjects();
+      setShowProjectModal(false);
+      resetProjectForm();
+      navigate('/');
+    } catch (error) {
+      setProjectError(error instanceof Error ? error.message : '创建项目失败');
+    } finally {
+      setCreatingProject(false);
+    }
+  };
+
+  return (
+    <div
+      className="flex h-screen w-full overflow-hidden font-sans select-none bg-stone-50 text-stone-900 dark:bg-[#161615] dark:text-stone-100"
+    >
+      <aside
+        ref={sidebarRef}
+        className="flex-shrink-0 flex flex-col bg-[#ECEAE6] border-r border-black/[.06] dark:bg-[#1A1A19] dark:border-white/[.06]"
+        style={{ width: sidebarWidth, minWidth: sidebarWidth }}
+      >
+        <div className="px-4 sm:px-5 pt-4 sm:pt-6 pb-3 sm:pb-4">
+          <button
+            onClick={handlePrLogoClick}
+            className="block text-left px-1 py-1 transition-colors cursor-default"
+          >
+            <p className="text-[17px] font-bold leading-tight tracking-tight text-stone-900 dark:text-stone-50">
+              PR
+            </p>
+            <p className="mt-0.5 text-[9px] font-semibold uppercase tracking-[0.18em] text-stone-400 dark:text-stone-500">
+              Project Review
+            </p>
+          </button>
+
+          <div className="relative mt-4" ref={projectMenuRef} style={{ width: projectTriggerWidth, maxWidth: '100%' }}>
+            <button
+              onClick={() => setShowProjectMenu((prev) => !prev)}
+              disabled={loadingProjects || switchingProject}
+              className="flex w-full items-center gap-2 rounded-2xl bg-black/[.03] px-3 py-2.5 text-left transition-colors hover:bg-black/[.05] disabled:opacity-60 dark:bg-white/[.04] dark:hover:bg-white/[.06]"
+            >
+              <div className="min-w-0 flex-1">
+                <p className="text-[10px] font-bold uppercase tracking-wider text-stone-400 dark:text-stone-500">
+                  当前项目
+                </p>
+                <p className="truncate text-xs font-semibold text-stone-700 dark:text-stone-200">
+                  {projectMenuLabel}
+                </p>
+              </div>
+              {switchingProject ? (
+                <Loader2 className="h-4 w-4 flex-shrink-0 animate-spin text-stone-400" />
+              ) : (
+                <ChevronDown className="h-4 w-4 flex-shrink-0 text-stone-400" />
+              )}
+            </button>
+
+            {showProjectMenu && (
+              <div
+                className="absolute left-0 z-20 mt-2 min-w-full overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-xl dark:border-stone-800 dark:bg-stone-900"
+                style={{ width: projectMenuWidth, maxWidth: 'calc(100vw - 2rem)' }}
+              >
+                <div className="max-h-64 overflow-y-auto p-1.5">
+                  {projects.length === 0 ? (
+                    <p className="px-3 py-2 text-xs text-stone-400 dark:text-stone-500">暂无项目配置</p>
+                  ) : (
+                    projects.map((project) => {
+                      const isActive = project.id === activeProject?.id;
+                      return (
+                        <div key={project.id} className="flex items-stretch gap-1">
+                          <button
+                            onClick={() => handleSwitchProject(project)}
+                            className={`flex min-w-0 flex-1 items-center gap-2 rounded-xl px-3 py-2 text-left text-xs transition-colors cursor-default ${
+                              isActive
+                                ? 'bg-stone-100 text-stone-800 dark:bg-stone-800 dark:text-stone-100'
+                                : 'text-stone-600 hover:bg-stone-50 dark:text-stone-300 dark:hover:bg-stone-800/70'
+                            }`}
+                          >
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate font-semibold">{project.name}</span>
+                              <span className="block truncate text-[10px] text-stone-400 dark:text-stone-500">
+                                {project.cloneBasePath || '未设置目录'}
+                              </span>
+                            </span>
+                            {isActive && <Check className="h-3.5 w-3.5 flex-shrink-0 text-emerald-500" />}
+                          </button>
+                          <button
+                            onClick={() => {
+                              prepareBatchProjectForm(project);
+                              setShowProjectMenu(false);
+                              setShowProjectModal(true);
+                            }}
+                            disabled={switchingProject || creatingProject}
+                            className="flex flex-shrink-0 items-center gap-1 rounded-xl px-2.5 py-2 text-[11px] font-semibold text-stone-400 transition-colors hover:bg-slate-50 hover:text-slate-700 disabled:opacity-50 dark:hover:bg-slate-500/10 dark:hover:text-slate-200"
+                            title={`基于 ${project.name} 新建领题批次`}
+                          >
+                            <CopyPlus className="h-3.5 w-3.5" />
+                            新批次
+                          </button>
+                          <button
+                            onClick={() => handleOpenDeleteProject(project)}
+                            disabled={switchingProject || deletingProject}
+                            className="flex flex-shrink-0 items-center gap-1 rounded-xl px-2.5 py-2 text-[11px] font-semibold text-stone-400 transition-colors hover:bg-red-50 hover:text-red-600 disabled:opacity-50 dark:hover:bg-red-500/10 dark:hover:text-red-300"
+                            title={`删除项目 ${project.name}`}
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                            删除
+                          </button>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+                <div className="border-t border-stone-100 p-1.5 dark:border-stone-800">
+                  <button
+                    onClick={() => {
+                      setShowProjectMenu(false);
+                      resetProjectForm();
+                      setProjectModalMode('create');
+                      setShowProjectModal(true);
+                    }}
+                    className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-xs font-semibold text-stone-600 transition-colors hover:bg-stone-50 dark:text-stone-300 dark:hover:bg-stone-800/70"
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                    新建项目
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {projectMenuError && (
+            <p className="mt-2 px-1 text-[11px] text-red-500">{projectMenuError}</p>
+          )}
+        </div>
+
+        <nav className="flex-1 px-3 space-y-0.5">
+          {NAV_ITEMS.map(({ to, end, icon: Icon, label }) => (
+            <NavLink
+              key={to}
+              to={to}
+              end={end}
+              className={({ isActive }) =>
+                `flex items-center gap-2.5 px-3 py-2 rounded-xl text-[13px] font-medium transition-all duration-150 cursor-default ${
+                  isActive
+                    ? 'bg-[#E7EDF5] dark:bg-[#1A1F29] text-[#111827] dark:text-[#F8FBFF] shadow-sm shadow-black/[.05]'
+                    : 'text-stone-500 dark:text-stone-400 hover:bg-black/[.04] dark:hover:bg-white/[.05] hover:text-stone-800 dark:hover:text-stone-200'
+                }`
+              }
+            >
+              <Icon className="h-[15px] w-[15px] flex-shrink-0" />
+              {label}
+            </NavLink>
+          ))}
+        </nav>
+
+        <div className="px-3 pb-3 sm:pb-5">
+          <div className="mb-2 h-px bg-black/[.06] dark:bg-white/[.07]" />
+          <div className="flex items-center justify-between px-1">
+            <NavLink
+              to="/settings"
+              className={({ isActive }) =>
+                `p-2 rounded-xl transition-all duration-150 cursor-default ${
+                  isActive
+                    ? 'bg-[#E7EDF5] dark:bg-[#1A1F29] text-[#111827] dark:text-[#F8FBFF] shadow-sm shadow-black/[.05]'
+                    : 'text-stone-500 dark:text-stone-400 hover:bg-black/[.04] dark:hover:bg-white/[.05] hover:text-stone-800 dark:hover:text-stone-200'
+                }`
+              }
+              title="设置"
+            >
+              <Settings className="h-[15px] w-[15px]" />
+            </NavLink>
+            <button
+              onClick={() => {
+                resetProjectForm();
+                setShowProjectModal(true);
+              }}
+              className="p-2 rounded-xl text-stone-500 transition-colors hover:bg-black/[.04] hover:text-stone-800 dark:text-stone-400 dark:hover:bg-white/[.05] dark:hover:text-stone-200"
+              title="新建项目"
+            >
+              <Plus className="h-[15px] w-[15px]" />
+            </button>
+          </div>
+        </div>
+      </aside>
+
+      <div
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="调整侧边栏宽度"
+        onPointerDown={handleSidebarResizeStart}
+        onDoubleClick={handleSidebarResizeReset}
+        className="group relative flex w-3 flex-shrink-0 cursor-col-resize touch-none items-stretch bg-stone-50/90 dark:bg-[#161615]"
+        title="拖动调整侧边栏宽度，双击恢复默认"
+      >
+        <div className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-black/[.06] dark:bg-white/[.08]" />
+        <div
+          className={`absolute inset-y-6 left-1/2 w-1.5 -translate-x-1/2 rounded-full transition-all ${
+            sidebarDragging
+              ? 'bg-slate-500/80 shadow-[0_0_0_4px_rgba(100,116,139,0.12)] dark:bg-slate-300/80'
+              : 'bg-stone-300/90 opacity-0 group-hover:opacity-100 dark:bg-stone-600/90'
+          }`}
+        />
+      </div>
+
+      <main className="flex-1 min-w-0 overflow-hidden flex flex-col bg-stone-50 dark:bg-[#161615]">
+        <div className="flex-1 overflow-auto">
+          <Outlet />
+        </div>
+      </main>
+
+      <BackgroundJobPanel />
+
+      {showProjectModal && (
+        <div className="fixed inset-0 z-50 flex items-start justify-center p-3 pt-4 sm:p-4 sm:pt-6 md:items-center md:p-6">
+          <div
+            className="absolute inset-0 bg-black/20 backdrop-blur-sm dark:bg-black/45"
+            onClick={() => {
+              if (creatingProject) return;
+              setShowProjectModal(false);
+              resetProjectForm();
+            }}
+          />
+          <div className="relative flex w-full max-w-5xl max-h-[94vh] flex-col overflow-hidden rounded-3xl border border-stone-200 bg-white shadow-2xl dark:border-stone-800 dark:bg-stone-900">
+            <div className="flex items-start justify-between gap-4 border-b border-stone-100 px-4 sm:px-6 py-4 sm:py-5 dark:border-stone-800">
+              <div>
+                <h2 className="text-lg font-bold text-stone-900 dark:text-stone-50">
+                  {projectModalMode === 'batch' ? '新建领题批次' : '新建项目'}
+                </h2>
+                <p className="mt-1 text-xs sm:text-sm text-stone-500 dark:text-stone-400">
+                  {projectModalMode === 'batch'
+                    ? '复制当前项目配置并使用新的本地目录，后续领题序号会从 -1 重新开始'
+                    : '配置项目目录、模型列表、源码来源和任务配额'}
+                </p>
+              </div>
+              <button
+                onClick={() => {
+                  if (creatingProject) return;
+                  setShowProjectModal(false);
+                  resetProjectForm();
+                }}
+                className="p-2 rounded-xl text-stone-400 hover:bg-stone-100 dark:hover:bg-stone-800"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto px-4 sm:px-6 py-4 sm:py-5">
+              <div className="grid gap-5 md:grid-cols-2">
+                <div className="space-y-5">
+                  <label className="block">
+                    <span className="mb-2 block text-sm font-medium text-stone-700 dark:text-stone-300">
+                      项目名称
+                    </span>
+                    <input
+                      value={projectForm.name}
+                      onChange={(event) => setProjectForm((prev) => ({ ...prev, name: event.target.value }))}
+                      placeholder="例如：评审项目"
+                      className={inputCls}
+                    />
+                  </label>
+
+                  <label className="block">
+                    <span className="mb-2 block text-sm font-medium text-stone-700 dark:text-stone-300">
+                      项目文件位置
+                    </span>
+                    <div className="flex gap-2.5">
+                      <input
+                        value={projectForm.basePath}
+                        onChange={(event) => setProjectForm((prev) => ({ ...prev, basePath: event.target.value }))}
+                        placeholder="请输入项目目录路径"
+                        className={`${inputCls} flex-1`}
+                      />
+                      <button
+                        onClick={handlePickProjectDirectory}
+                        disabled={pickingProjectDir}
+                        className="flex items-center gap-2 rounded-2xl bg-stone-100 px-4 py-2.5 text-sm font-semibold text-stone-700 transition-colors hover:bg-stone-200 disabled:opacity-50 dark:bg-stone-800 dark:text-stone-300 dark:hover:bg-stone-700"
+                      >
+                        {pickingProjectDir ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <FolderOpen className="h-4 w-4" />
+                        )}
+                        浏览
+                      </button>
+                    </div>
+                    <p className="mt-2 text-xs text-stone-400 dark:text-stone-500">
+                      请选择空文件夹。选中后会自动将目录名带入项目名称。
+                    </p>
+                  </label>
+
+                  <div>
+                    <span className="mb-2 block text-sm font-medium text-stone-700 dark:text-stone-300">
+                      模型列表
+                    </span>
+                    <div className="space-y-1.5">
+                      {modelList.map((model) => (
+                        <div
+                          key={model.id}
+                          className="group flex items-center gap-3 rounded-2xl border border-stone-200 bg-stone-50 px-3.5 py-2.5 dark:border-stone-700 dark:bg-stone-800/50"
+                        >
+                          <Terminal className="h-3.5 w-3.5 flex-shrink-0 text-stone-400" />
+                          <span className="flex-1 font-mono text-sm text-stone-700 dark:text-stone-300">
+                            {model.name}
+                          </span>
+                          {isOriginModel(model.name) && (
+                            <span className="text-[10px] font-bold uppercase tracking-wider text-stone-400 dark:text-stone-500">
+                              原始
+                            </span>
+                          )}
+                          {!isOriginModel(model.name) && (
+                            <button
+                              onClick={() => handleRemoveModel(model.id)}
+                              className="p-1 text-stone-400 opacity-0 transition-all hover:text-red-500 group-hover:opacity-100"
+                              aria-label={`删除 ${model.name}`}
+                            >
+                              <X className="h-3.5 w-3.5" />
+                            </button>
+                          )}
+                        </div>
+                      ))}
+
+                      {addingModel ? (
+                        <div className="flex items-center gap-2 px-1 pt-1">
+                          <input
+                            type="text"
+                            value={newModelName}
+                            onChange={(event) => setNewModelName(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === 'Enter') handleAddModel();
+                              if (event.key === 'Escape') {
+                                setAddingModel(false);
+                                setNewModelName('');
+                              }
+                            }}
+                            placeholder="模型名，例如：cotv22-pro"
+                            autoFocus
+                            className={`${inputCls} flex-1 font-mono`}
+                          />
+                          <button
+                            onClick={handleAddModel}
+                            className="rounded-full bg-[#111827] px-3 py-2 text-sm font-semibold text-white transition-colors hover:bg-[#1F2937] dark:bg-[#E5EAF2] dark:text-[#0D1117] dark:hover:bg-[#F3F6FB]"
+                          >
+                            确认
+                          </button>
+                          <button
+                            onClick={() => {
+                              setAddingModel(false);
+                              setNewModelName('');
+                            }}
+                            className="rounded-xl px-3 py-2 text-sm text-stone-500 transition-colors hover:text-stone-700 dark:hover:text-stone-300"
+                          >
+                            取消
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          onClick={() => setAddingModel(true)}
+                          className="flex items-center gap-2 px-1 py-1.5 text-sm font-semibold text-slate-700 transition-colors hover:text-slate-900 dark:text-slate-300 dark:hover:text-slate-100"
+                        >
+                          <Plus className="h-4 w-4" />
+                          添加模型
+                        </button>
+                      )}
+                    </div>
+                    <p className="mt-1.5 text-xs text-stone-400 dark:text-stone-500">
+                      ORIGIN 为原始参照副本，不可删除。
+                    </p>
+                  </div>
+                </div>
+
+                <div className="space-y-5">
+                  <div>
+                    <span className="mb-1 block text-sm font-medium text-stone-700 dark:text-stone-300">
+                      任务类型约束
+                    </span>
+                    <p className="mb-3 text-xs text-stone-400 dark:text-stone-500">
+                      任务总量：整个项目该类型可创建的任务上限。单题上限：同一个 GitLab 项目在该类型下最多领取的次数。留空均为不限。
+                    </p>
+                    <TaskTypeQuotaEditor
+                      taskTypes={taskTypes}
+                      quotas={quotas}
+                      totals={totals}
+                      onTaskTypesChange={setTaskTypes}
+                      onQuotasChange={setQuotas}
+                      onTotalsChange={setTotals}
+                    />
+                  </div>
+
+                  <label className="block">
+                    <span className="mb-2 block text-sm font-medium text-stone-700 dark:text-stone-300">
+                      源码模型
+                    </span>
+                    <select
+                      value={projectForm.sourceModelFolder}
+                      onChange={(event) =>
+                        setProjectForm((prev) => ({ ...prev, sourceModelFolder: event.target.value }))
+                      }
+                      className={`${inputCls} font-mono`}
+                    >
+                      {sourceModelOptions.map((modelName) => (
+                        <option key={modelName} value={modelName}>
+                          {modelName}
+                        </option>
+                      ))}
+                    </select>
+                    <p className="mt-1.5 text-xs text-stone-400 dark:text-stone-500">
+                      这里指定哪个模型副本作为源码来源。实际目录会自动使用 `label-xxxxx-任务类型 / 项目ID-任务类型` 规则。
+                    </p>
+                  </label>
+
+                  <label className="block">
+                    <span className="mb-2 block text-sm font-medium text-stone-700 dark:text-stone-300">
+                      项目记录
+                    </span>
+                    <textarea
+                      value={projectForm.overviewMarkdown}
+                      onChange={(event) =>
+                        setProjectForm((prev) => ({ ...prev, overviewMarkdown: event.target.value }))
+                      }
+                      placeholder={'支持 Markdown，例如：\n# 里程碑\n- 已完成首轮验收\n- 待补充回归记录'}
+                      rows={10}
+                      className={`${inputCls} min-h-[220px] resize-y leading-6`}
+                    />
+                    <p className="mt-1.5 text-xs text-stone-400 dark:text-stone-500">
+                      会展示在“项目概况”里，适合记录阶段说明、里程碑、注意事项和文档链接。
+                    </p>
+                  </label>
+                </div>
+              </div>
+
+            </div>
+
+            <div className="border-t border-stone-100 px-6 py-4 dark:border-stone-800">
+              {projectError && (
+                <div
+                  role="alert"
+                  aria-live="polite"
+                  className="mb-4 flex items-start gap-3 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-600 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-200"
+                >
+                  <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0" />
+                  <p>{projectError}</p>
+                </div>
+              )}
+
+              <div className="flex justify-end gap-3">
+                <button
+                  onClick={() => {
+                    if (creatingProject) return;
+                    setShowProjectModal(false);
+                    resetProjectForm();
+                  }}
+                  className="rounded-2xl bg-stone-100 px-4 py-2.5 text-sm font-semibold text-stone-700 dark:bg-stone-800 dark:text-stone-300"
+                >
+                  取消
+                </button>
+                <button
+                  onClick={handleCreateProject}
+                  disabled={creatingProject}
+                  className="rounded-2xl bg-[#111827] px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-[#1F2937] disabled:opacity-50 dark:bg-[#E5EAF2] dark:text-[#0D1117] dark:hover:bg-[#F3F6FB]"
+                >
+                  {creatingProject
+                    ? '创建中...'
+                    : projectModalMode === 'batch'
+                      ? '创建批次'
+                      : '创建项目'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {projectPendingDelete && (
+        <DeleteProjectDialog
+          project={projectPendingDelete}
+          deleting={deletingProject}
+          error={deleteProjectError}
+          onCancel={handleCloseDeleteProject}
+          onConfirm={handleConfirmDeleteProject}
+        />
+      )}
+    </div>
+  );
+}
+
+function DeleteProjectDialog({
+  project,
+  deleting,
+  error,
+  onCancel,
+  onConfirm,
+}: {
+  project: ProjectConfig;
+  deleting: boolean;
+  error: string;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 md:p-6">
+      <div
+        className="absolute inset-0 bg-black/20 backdrop-blur-sm dark:bg-black/45"
+        onClick={() => {
+          if (deleting) return;
+          onCancel();
+        }}
+      />
+      <div className="relative w-full max-w-md max-h-[90vh] overflow-y-auto rounded-3xl border border-stone-200 bg-white p-5 sm:p-6 shadow-2xl dark:border-stone-800 dark:bg-stone-900">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-bold text-stone-900 dark:text-stone-50">确认删除项目</h2>
+            <p className="mt-2 text-sm text-stone-500 dark:text-stone-400">
+              将从 PINRU 中删除项目「{project.name}」的配置。
+            </p>
+            <p className="mt-2 text-sm text-stone-500 dark:text-stone-400">
+              不会删除项目文件夹，也不会自动清理本地已经存在的源码或模型副本目录。
+            </p>
+          </div>
+          <button
+            onClick={() => {
+              if (deleting) return;
+              onCancel();
+            }}
+            className="rounded-xl p-2 text-stone-400 transition-colors hover:bg-stone-100 dark:hover:bg-stone-800"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        {error && <p className="mt-4 text-sm text-red-500">{error}</p>}
+
+        <div className="mt-6 flex justify-end gap-3">
+          <button
+            onClick={() => {
+              if (deleting) return;
+              onCancel();
+            }}
+            className="rounded-2xl bg-stone-100 px-4 py-2.5 text-sm font-semibold text-stone-700 dark:bg-stone-800 dark:text-stone-300"
+          >
+            取消
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={deleting}
+            className="inline-flex items-center gap-2 rounded-2xl bg-red-600 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-red-700 disabled:opacity-50"
+          >
+            {deleting && <Loader2 className="h-4 w-4 animate-spin" />}
+            {deleting ? '删除中...' : '确认删除'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}

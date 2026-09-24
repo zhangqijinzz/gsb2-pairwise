@@ -1,0 +1,318 @@
+import {
+  buildManagedSourceFolderPathWithSequence,
+  buildManagedTaskFolderPathWithSequence,
+} from '../../../shared/lib/sourceFolders';
+import { isLocalSyntheticProjectId } from '../../../shared/lib/taskId';
+import type { QuestionBankItem } from '../../../api/git';
+import type { ClaimResult, ModelEntry } from '../types';
+
+export function formatProjectName(value: string) {
+  return `label-${value.padStart(5, '0')}`;
+}
+
+export function buildProjectRef(value: string) {
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) {
+    return `prompt2repo/${formatProjectName(trimmed)}`;
+  }
+  return trimmed;
+}
+
+export function buildProjectBasePath(
+  projectName: string,
+  taskType: string,
+  root: string,
+  sequence = 0,
+) {
+  return buildManagedTaskFolderPathWithSequence(root, projectName, taskType, sequence);
+}
+
+export function buildProjectSourcePath(
+  projectNumber: string,
+  taskType: string,
+  basePath: string,
+  sequence = 0,
+) {
+  return buildManagedSourceFolderPathWithSequence(basePath, projectNumber, taskType, sequence);
+}
+
+export function formatClaimProjectId(projectId: string, sequence: number) {
+  return sequence > 0 ? `${projectId}-${sequence}` : projectId;
+}
+
+export function partitionClaimsByProjectLimit<T>(
+  claims: T[],
+  getProjectId: (claim: T) => string,
+  existingCounts: ReadonlyMap<string, number>,
+  limit: number | null,
+) {
+  if (limit === null || limit <= 0) {
+    return {
+      executableClaims: claims,
+      exceededClaims: [] as T[],
+    };
+  }
+
+  const counts = new Map(existingCounts);
+  const executableClaims: T[] = [];
+  const exceededClaims: T[] = [];
+
+  for (const claim of claims) {
+    const projectId = getProjectId(claim).trim();
+    const currentCount = counts.get(projectId) ?? 0;
+
+    if (currentCount >= limit) {
+      exceededClaims.push(claim);
+      continue;
+    }
+
+    executableClaims.push(claim);
+    counts.set(projectId, currentCount + 1);
+  }
+
+  return {
+    executableClaims,
+    exceededClaims,
+  };
+}
+
+export function parseProjectIds(value: string): string[] {
+  const tokens = value
+    .split(/[\s,，、;；]+/)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  for (const token of tokens) {
+    const normalized = normalizeProjectLookupToken(token);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    ids.push(normalized);
+  }
+  return ids;
+}
+
+export function normalizeProjectLookupToken(value: string): string {
+  const trimmed = value.trim().replace(/^\/+|\/+$/g, '');
+  if (!trimmed) return '';
+  if (/^\d+$/.test(trimmed)) {
+    return String(Number.parseInt(trimmed, 10));
+  }
+  if (!/^[A-Za-z0-9._/-]+$/.test(trimmed)) {
+    return '';
+  }
+  if (trimmed.includes('/')) {
+    return trimmed;
+  }
+  if (/^label-\d+$/i.test(trimmed)) {
+    return trimmed.toLowerCase();
+  }
+  if (/^[A-Za-z]+-\d+$/i.test(trimmed)) {
+    return trimmed.toLowerCase();
+  }
+  return '';
+}
+
+export function gitLabProjectNumericId(project: { id?: number | string } | null | undefined): number | null {
+  const value = Number(project?.id);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+export function displayProjectLookupToken(value: string): string {
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) {
+    return trimmed;
+  }
+  return trimmed;
+}
+
+export function isOriginModel(value: string): boolean {
+  return value.trim().toUpperCase() === 'ORIGIN';
+}
+
+export function pickSourceModel(
+  models: ModelEntry[],
+  preferredSourceModelName: string,
+): ModelEntry {
+  return (
+    models.find(
+      (model) =>
+        model.id.trim().toUpperCase() === preferredSourceModelName.trim().toUpperCase(),
+    ) ??
+    models.find((model) => isOriginModel(model.id)) ??
+    models[0]
+  );
+}
+
+export function getModelStatusLabel(status: ModelEntry['status']): string {
+  switch (status) {
+    case 'done':
+      return '✓ 完成';
+    case 'cloning':
+      return 'git clone 中…';
+    case 'copying':
+      return '复制并初始化 Git…';
+    case 'error':
+      return '✗ 失败';
+    default:
+      return '等待';
+  }
+}
+
+export function getModelStatusClassName(status: ModelEntry['status']): string {
+  switch (status) {
+    case 'done':
+      return 'text-emerald-600 dark:text-emerald-400';
+    case 'cloning':
+    case 'copying':
+      return 'text-slate-700 dark:text-slate-300';
+    case 'error':
+      return 'text-red-500';
+    default:
+      return 'text-stone-400';
+  }
+}
+
+export function getModelStatusBarClassName(status: ModelEntry['status']): string {
+  switch (status) {
+    case 'cloning':
+    case 'copying':
+      return 'w-full bg-slate-500 animate-pulse';
+    case 'done':
+      return 'w-full bg-emerald-500';
+    case 'error':
+      return 'w-full bg-red-400';
+    default:
+      return 'w-0';
+  }
+}
+
+/* ─── Question Bank Helpers ─── */
+
+export function parseQuestionBankProjectIds(raw: string): number[] {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(trimmed);
+    const values = Array.isArray(parsed) ? parsed : [];
+    const normalized = values
+      .map((value) => String(value).trim())
+      .filter(Boolean)
+      .map((value) => Number.parseInt(value, 10))
+      .filter((value) => Number.isFinite(value) && value > 0);
+    return [...new Set(normalized)];
+  } catch {
+    return [];
+  }
+}
+
+export function getQuestionBankSourceKindLabel(sourceKind: string) {
+  switch (sourceKind) {
+    case 'gitlab':
+      return 'GitLab';
+    case 'local_archive':
+      return '本地压缩包';
+    case 'local_directory':
+      return '本地目录';
+    default:
+      return sourceKind || '未知来源';
+  }
+}
+
+export function getQuestionBankStatusMeta(status: string) {
+  switch (status) {
+    case 'ready':
+      return {
+        label: '可建题',
+        className:
+          'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400',
+      };
+    case 'error':
+      return {
+        label: '异常',
+        className: 'bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400',
+      };
+    default:
+      return {
+        label: status || '未知状态',
+        className:
+          'bg-stone-100 dark:bg-stone-800/60 text-stone-500 dark:text-stone-400',
+      };
+  }
+}
+
+export function isLocalQuestionBankItem(item: Pick<QuestionBankItem, 'sourceKind' | 'questionId'>) {
+  return (
+    item.sourceKind === 'local_archive' ||
+    item.sourceKind === 'local_directory' ||
+    isLocalSyntheticProjectId(item.questionId)
+  );
+}
+
+export function buildQuestionBankLimitKey(
+  item: Pick<QuestionBankItem, 'questionId' | 'displayName' | 'sourceKind'>,
+) {
+  if (isLocalQuestionBankItem(item)) {
+    return `local:${item.displayName.trim().toLowerCase()}`;
+  }
+  return `gitlab:${String(item.questionId).trim()}`;
+}
+
+export function buildTaskLimitKey(projectId: string, projectName: string) {
+  if (isLocalSyntheticProjectId(projectId) && projectName.trim()) {
+    return `local:${projectName.trim().toLowerCase()}`;
+  }
+  return `gitlab:${projectId.trim()}`;
+}
+
+export function getQuestionBankDisplayProjectId(
+  item: Pick<QuestionBankItem, 'questionId' | 'displayName' | 'sourceKind'>,
+  sequence: number,
+) {
+  if (isLocalQuestionBankItem(item)) {
+    return `${item.displayName}${sequence > 0 ? `-${sequence}` : ''}`;
+  }
+  return formatClaimProjectId(String(item.questionId), sequence);
+}
+
+export function getResultStatusMeta(status: ClaimResult['status']): {
+  label: string;
+  className: string;
+} {
+  switch (status) {
+    case 'running':
+      return {
+        label: '处理中',
+        className: 'bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400',
+      };
+    case 'done':
+      return {
+        label: '完成',
+        className:
+          'bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400',
+      };
+    case 'partial':
+      return {
+        label: '部分完成',
+        className: 'bg-sky-50 dark:bg-sky-500/10 text-sky-700 dark:text-sky-400',
+      };
+    case 'error':
+      return {
+        label: '失败',
+        className: 'bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400',
+      };
+    case 'quota_exceeded':
+      return {
+        label: '配额不足',
+        className: 'bg-orange-50 dark:bg-orange-500/10 text-orange-600 dark:text-orange-400',
+      };
+    default:
+      return {
+        label: '等待中',
+        className:
+          'bg-stone-100 dark:bg-stone-800/60 text-stone-500 dark:text-stone-400',
+      };
+  }
+}

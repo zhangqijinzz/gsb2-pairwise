@@ -1,0 +1,73 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["isCompleted", "isSatisfied", "projectType", "changeScope", "reviewNotes", "nextPrompt", "nextPromptTaskType", "keyLocations", "issues"],
+  "properties": {
+    "isCompleted": {
+      "type": "boolean",
+      "description": "是否完成：提示词要求的核心交付物已经落到代码或文件里；80%左右可判定完成，但不等于满意"
+    },
+    "isSatisfied": {
+      "type": "boolean",
+      "description": "是否满意：提示词的主要求已覆盖且质量达到 90 分及以上；80%左右只能算完成但不满意。Feature迭代、0-1代码生成、Bug修复不能只因看到相关代码改动就满意，必须能核清入口、数据来源/接口返回、状态或持久化变化、前端展示/用户反馈等主链路；关键链路证据不足时填 false。代码理解类按文档交付物覆盖度判断，可相对宽松"
+    },
+    "projectType": {
+      "type": "string",
+      "description": "项目类型，如：全栈Web应用、Web前端、纯后端服务等"
+    },
+    "changeScope": {
+      "type": "string",
+      "enum": ["单文件", "模块内多文件", "跨模块多文件", "跨系统多模块"],
+      "description": "修改范围"
+    },
+    "reviewNotes": {
+      "type": "string",
+      "description": "复审点评；满意时也不能只填「无」，必须简要说明已核验的核心要求、关键代码证据和主流程依据；如果产物满意但处理过程存在不满意，可以在 reviewNotes 中明确输出“过程不满意：...”，但不要因此自动把 isSatisfied 改成 false。当 isCompleted=false 或 isSatisfied=false 时，必须回指 original_prompt/current_prompt 中对应的具体句子、短语或明确要求，不能用未写明的扩展点作为主缺口。若仅静态取证且无法确认 Feature/Bug/0-1 的关键主流程，需说明缺少哪段流程证据并判定不满意；不满意时必须给出具体不满意原因，不能只写“证据不足/测试不足/未运行页面”等泛化结论。特殊规则：如果不满意的原因是没有读取到实际代码变动、没有拿到本轮有效改动或无法确认本轮真实代码变化，reviewNotes 只写“异常输出”，不要写过程不满意或产物不满意"
+    },
+    "nextPrompt": {
+      "type": "string",
+      "description": "下一轮提示词建议，满意时填「无」；只允许围绕 reviewNotes 已回指的主缺口给出最小修复指令，不得扩展额外需求；不满意时必须给出可执行的最小修复词，不能留空或只写“重新检查”。特殊规则：如果 reviewNotes 是“异常输出”，nextPrompt 必须填“无”，不要给修复提示词。红线：nextPrompt 一定不能和 current_prompt/上一轮会话提示词雷同，不能复述上一轮提示词、照抄原句或只替换少量词，必须基于本轮 reviewNotes 描述的当前问题现状重新组织。nextPrompt 必须使用自然语言清晰、顺畅、连贯地直接描述问题现状和修复后的业务结果，不要写废话，不要描述问题原因或代码原因。修复提示词尽量不包含代码，不写代码片段、文件、文件名、文件路径、类名、方法名、变量名或命令等代码细节，除非 current_prompt 本身就是代码级修复要求。Bug修复类 nextPrompt 必须以“修复”两个字开头，并像用户可执行的 bug 修复提示词：写清触发场景、当前异常、修复后的业务结果和必要边界；不要直接写“把 A 放到 B 前面”“修改某函数”“调整某字段”“在某文件里...”这类实现方案，也不要写“验收时确认”“补齐链路”“核验闭环”这类复审口吻，除非 current_prompt 本身就是代码级修复要求。Bug修复类不要沿用 current_prompt 的长开头，先改写成短的问题名，再写修复后的表现，通常控制在 2 到 3 句；同一对象不要反复出现，后文用自然指代即可"
+    },
+    "nextPromptTaskType": {
+      "type": "string",
+      "enum": ["Bug修复", "Feature迭代", "0-1代码生成", "代码理解", "代码重构", "工程化", "代码测试", "未归类"],
+      "description": "nextPrompt 对应的提示词任务类型；满意且 nextPrompt 为「无」时填「未归类」"
+    },
+    "keyLocations": {
+      "type": "string",
+      "description": "关键代码位置，格式：相对路径:行号；相对路径:行号，最多 3 处"
+    },
+    "issues": {
+      "type": "array",
+      "description": "当当前节点存在多个独立问题时，逐条拆分为子问题；通过时返回空数组。每个子问题都只能对应 prompt 中明确写出的要求，不能把未写明的扩展点当作主缺口",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title", "issueType", "reviewNotes", "nextPrompt", "keyLocations"],
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "子问题标题，要求可直接作为树节点标题展示"
+          },
+          "issueType": {
+            "type": "string",
+            "description": "子问题类型，一般填写“Bug修复”"
+          },
+          "reviewNotes": {
+            "type": "string",
+            "description": "这个子问题对应的不满意结论；必须回指 original_prompt/current_prompt 中对应的具体句子、短语或明确要求。特殊规则：如果不满意的原因是没有读取到实际代码变动、没有拿到本轮有效改动或无法确认本轮真实代码变化，只写“异常输出”"
+          },
+          "nextPrompt": {
+            "type": "string",
+            "description": "这个子问题下一次复核时应携带的提示词；只修复当前子问题对应的主缺口，不得扩展额外需求。特殊规则：如果 reviewNotes 是“异常输出”，nextPrompt 必须填“无”。红线：不能和 current_prompt/上一轮会话提示词雷同，必须基于当前子问题的问题现状重新组织。提示词必须自然、清晰、顺畅、连贯，不写废话，不描述问题原因。修复提示词尽量不包含代码，不写代码片段、文件、文件名、文件路径、类名、方法名、变量名或命令等代码细节，除非 current_prompt 本身就是代码级修复要求。Bug修复类必须以“修复”两个字开头，并写成触发场景、当前异常、修复后的业务结果和必要边界，不要直接写代码实现步骤，也不要写成“验收时确认”“补齐链路”“核验闭环”这类复审口吻。Bug修复类不要沿用 current_prompt 的长开头，先改写成短的问题名，再写修复后的表现，通常控制在 2 到 3 句"
+          },
+          "keyLocations": {
+            "type": "string",
+            "description": "这个子问题对应的关键代码位置，格式同上"
+          }
+        }
+      }
+    }
+  }
+}

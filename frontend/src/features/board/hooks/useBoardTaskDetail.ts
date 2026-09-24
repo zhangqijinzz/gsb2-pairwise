@@ -1,0 +1,1632 @@
+import { useEffect, useMemo, useRef, useState } from 'react';
+import type { TaskDetailDrawerTab } from '../../../shared/components/TaskDetailDrawer';
+import {
+  buildTaskTypeChangeConfirmMessage,
+  DEFAULT_TASK_TYPE,
+  getLlmProviders,
+  getProjectTaskSettings,
+  getTaskTypeDisplayLabel,
+  getTaskTypeQuotaRawValue,
+  normalizeTaskTypeName,
+  type ProjectConfig,
+} from '../../../api/config';
+import {
+  generateTaskPrompt,
+  saveTaskPrompt,
+  type GeneratePromptRequest,
+  type LlmProviderConfig,
+} from '../../../api/llm';
+import {
+  commitCode,
+  listCodePushRecords,
+  pushCode,
+  redoCommit,
+  type CodePushRecord,
+} from '../../../api/codePush';
+import {
+  submitJob,
+  submitSessionSyncJob,
+  type JobProgressEvent,
+} from '../../../api/job';
+import {
+  extractTaskSessions,
+  getTask,
+  getTaskReadme,
+  listAiReviewRounds,
+  listModelRuns,
+  resetTaskAiReview,
+  resetAiReviewRound,
+  updateTaskSessionList,
+  updateTaskStatus,
+  updateTaskType,
+  type AiReviewRoundFromDB,
+  type ExtractTaskSessionCandidate,
+  type ModelRunFromDB,
+  type PromptGenerationStatus,
+  type TaskFromDB,
+  type TaskReadme,
+  type TaskSession as TaskSessionRecord,
+} from '../../../api/task';
+import {
+  buildSessionModelOptions,
+  filterCandidatesForModel,
+} from '../../../shared/lib/sessionCandidateUtils';
+import {
+  buildDraftsFromExtractedCandidate,
+  buildSessionEditorOpenSet,
+  createSessionDraft,
+  hasSessionDraftChanges,
+  hydrateSessionDrafts,
+  mapSessionDraftsToSessionList,
+  type EditableTaskSession,
+} from '../../../shared/lib/sessionUtils';
+import {
+  PROMPT_GENERATION_STATUS,
+  normalizePromptGenerationStatus,
+} from '../components/BoardPresentation';
+import { useAppStore, type Task, type TaskStatus } from '../../../store';
+import { writeClipboardText } from '../../../shared/lib/clipboard';
+
+const PROMPT_GENERATION_TIMEOUT_MS = 1_200_000;
+
+function normalizeModelRunList(
+  modelRuns: ModelRunFromDB[] | null | undefined,
+): ModelRunFromDB[] {
+  return Array.isArray(modelRuns) ? modelRuns : [];
+}
+
+function normalizeAiReviewRoundList(
+  rounds: AiReviewRoundFromDB[] | null | undefined,
+): AiReviewRoundFromDB[] {
+  return Array.isArray(rounds) ? rounds : [];
+}
+
+function normalizeLlmProviderList(
+  providers: LlmProviderConfig[] | null | undefined,
+): LlmProviderConfig[] {
+  return Array.isArray(providers) ? providers : [];
+}
+
+function normalizeTaskReadme(
+  readme: TaskReadme | null | undefined,
+): TaskReadme | null {
+  if (!readme || typeof readme.content !== 'string') {
+    return null;
+  }
+  return readme;
+}
+
+function getDefaultTaskDetailTab(): TaskDetailDrawerTab {
+  return 'container';
+}
+
+function resolvePromptWritebackStatus(
+  currentStatus?: string | null,
+): TaskStatus {
+  if (currentStatus === 'Submitted' || currentStatus === 'ExecutionCompleted') {
+    return currentStatus;
+  }
+  return 'PromptReady';
+}
+
+function buildTaskTypeLimitReachedMessage(
+  taskType: string,
+  limit: number,
+  existingCount: number,
+) {
+  const taskTypeLabel = getTaskTypeDisplayLabel(taskType || DEFAULT_TASK_TYPE);
+  return [
+    `不能切换到「${taskTypeLabel}」。`,
+    `当前 GitLab 项目在该类型下已达到单题上限 ${limit}（已存在 ${existingCount} 张同类型题卡）。`,
+    '请先调整已有同类型题卡，或切换到其他任务类型。',
+  ].join('');
+}
+
+function humanizeTaskTypeChangeError(
+  error: unknown,
+  nextTaskType: string,
+  fallbackExistingCount?: number,
+  fallbackLimit?: number | null,
+) {
+  const rawMessage =
+    error instanceof Error ? error.message : '任务类型更新失败';
+
+  if (!rawMessage.includes('领题数已达上限')) {
+    return rawMessage;
+  }
+
+  const matchedLimit = rawMessage.match(/已达上限\s*(\d+)/);
+  const resolvedLimit = matchedLimit
+    ? Number(matchedLimit[1])
+    : fallbackLimit ?? null;
+
+  if (resolvedLimit !== null && resolvedLimit > 0) {
+    return buildTaskTypeLimitReachedMessage(
+      nextTaskType,
+      resolvedLimit,
+      fallbackExistingCount ?? resolvedLimit,
+    );
+  }
+
+  return `不能切换到「${getTaskTypeDisplayLabel(
+    nextTaskType || DEFAULT_TASK_TYPE,
+  )}」，该任务类型的单题上限已满。请先调整已有同类型题卡，或切换到其他任务类型。`;
+}
+
+function resolveLatestSession(run: ModelRunFromDB): { sessionId: string; sessionIndex: number } | null {
+  const sessions = Array.isArray(run.sessionList) ? run.sessionList : [];
+  for (let index = sessions.length - 1; index >= 0; index -= 1) {
+    const sessionId = sessions[index]?.sessionId?.trim();
+    if (sessionId) {
+      return { sessionId, sessionIndex: index };
+    }
+  }
+  const fallbackSessionId = run.sessionId?.trim();
+  if (fallbackSessionId) {
+    return { sessionId: fallbackSessionId, sessionIndex: Math.max(run.conversationRounds - 1, 0) };
+  }
+  return null;
+}
+
+type UseBoardTaskDetailArgs = {
+  activeProject: ProjectConfig | null;
+  availableTaskTypes: string[];
+  sourceModelName: string;
+  tasks: Task[];
+  loadTasks: () => Promise<void>;
+  loadActiveProject: () => Promise<void>;
+  updateTaskStatusInStore: (id: string, status: TaskStatus) => void;
+  updateTaskTypeInStore: (id: string, taskType: string) => void;
+};
+
+export function useBoardTaskDetail({
+  activeProject,
+  availableTaskTypes,
+  sourceModelName,
+  tasks,
+  loadTasks,
+  loadActiveProject,
+  updateTaskStatusInStore,
+  updateTaskTypeInStore,
+}: UseBoardTaskDetailArgs) {
+  const [selected, setSelected] = useState<Task | null>(null);
+  const [selectedTaskDetail, setSelectedTaskDetail] = useState<TaskFromDB | null>(null);
+  const [selectedTaskReadme, setSelectedTaskReadme] = useState<TaskReadme | null>(null);
+  const [selectedModelRuns, setSelectedModelRuns] = useState<ModelRunFromDB[]>([]);
+  const [selectedAiReviewRounds, setSelectedAiReviewRounds] = useState<AiReviewRoundFromDB[]>([]);
+  const [selectedCodePushRecords, setSelectedCodePushRecords] = useState<CodePushRecord[]>([]);
+  const [codePushActionKey, setCodePushActionKey] = useState<string | null>(null);
+  const [selectedSessionModelName, setSelectedSessionModelName] = useState('');
+  const [drawerLoading, setDrawerLoading] = useState(false);
+  const [drawerError, setDrawerError] = useState('');
+  const [statusChanging, setStatusChanging] = useState(false);
+  const [promptDraft, setPromptDraft] = useState('');
+  const [promptSaving, setPromptSaving] = useState(false);
+  const [promptCopied, setPromptCopied] = useState(false);
+  const [promptGeneratingTaskIds, setPromptGeneratingTaskIds] = useState<Set<string>>(
+    new Set(),
+  );
+  const [llmProviders, setLlmProviders] = useState<LlmProviderConfig[]>([]);
+  const [sessionListDraft, setSessionListDraft] = useState<EditableTaskSession[]>([]);
+  const [sessionListSaving, setSessionListSaving] = useState(false);
+  const [sessionSaveState, setSessionSaveState] = useState<'idle' | 'saved'>('idle');
+  const [sessionExtracting, setSessionExtracting] = useState(false);
+  const [sessionExtractCandidates, setSessionExtractCandidates] = useState<
+    ExtractTaskSessionCandidate[]
+  >([]);
+  const [openSessionEditors, setOpenSessionEditors] = useState<Set<string>>(new Set());
+  const [copiedSessionId, setCopiedSessionId] = useState<string | null>(null);
+  const [taskTypeChanging, setTaskTypeChanging] = useState(false);
+  const [aiReviewResetting, setAiReviewResetting] = useState(false);
+  const [activeDrawerTab, setActiveDrawerTab] =
+    useState<TaskDetailDrawerTab>(getDefaultTaskDetailTab());
+  const sessionDraftVersionRef = useRef(0);
+  const selectedTaskIdRef = useRef<string | null>(null);
+
+  const sessionTaskTypeOptions = useMemo(
+    () =>
+      getProjectTaskSettings(activeProject, [
+        ...tasks.map((task) => task.taskType),
+        ...tasks.flatMap((task) =>
+          task.sessionList.map((session) => session.taskType),
+        ),
+        ...sessionListDraft.map((session) => session.taskType),
+      ]).taskTypes,
+    [activeProject, sessionListDraft, tasks],
+  );
+  const projectTaskTypeQuotas = useMemo(
+    () =>
+      getProjectTaskSettings(
+        activeProject,
+        tasks.map((task) => task.taskType),
+      ).quotas,
+    [activeProject, tasks],
+  );
+
+  const selectedPromptGenerationStatus = normalizePromptGenerationStatus(
+    selectedTaskDetail?.promptGenerationStatus ??
+      selected?.promptGenerationStatus,
+  );
+  const selectedPromptGenerationMeta =
+    PROMPT_GENERATION_STATUS[selectedPromptGenerationStatus];
+  const selectedPromptGenerationError =
+    selectedTaskDetail?.promptGenerationError ??
+    selected?.promptGenerationError ??
+    null;
+  const promptSaveState: 'idle' | 'saved' =
+    promptDraft === (selectedTaskDetail?.promptText ?? '') ? 'saved' : 'idle';
+  const promptGenerating =
+    selected?.id !== undefined && selected?.id !== null
+      ? promptGeneratingTaskIds.has(selected.id)
+      : false;
+  const sessionModelOptions = useMemo(
+    () => buildSessionModelOptions(selectedModelRuns, sourceModelName),
+    [selectedModelRuns, sourceModelName],
+  );
+  const selectedSessionModelRun = useMemo(
+    () =>
+      selectedModelRuns.find(
+        (run) => run.modelName === selectedSessionModelName,
+      ) ?? null,
+    [selectedModelRuns, selectedSessionModelName],
+  );
+  const primaryTaskType =
+    normalizeTaskTypeName(
+      sessionListDraft[0]?.taskType ??
+        selectedSessionModelRun?.sessionList?.[0]?.taskType ??
+        selectedTaskDetail?.sessionList?.[0]?.taskType ??
+        selectedTaskDetail?.taskType ??
+        selected?.taskType ??
+        availableTaskTypes[0] ??
+        DEFAULT_TASK_TYPE,
+    ) || DEFAULT_TASK_TYPE;
+  const sessionFallbackTaskType =
+    selectedTaskDetail?.taskType ??
+    selected?.taskType ??
+    availableTaskTypes[0] ??
+    DEFAULT_TASK_TYPE;
+  const persistedSessionList =
+    selectedSessionModelRun?.sessionList ??
+    selectedTaskDetail?.sessionList ??
+    selected?.sessionList ??
+    null;
+  const hasUnsavedSessionChanges = useMemo(
+    () =>
+      selected !== null &&
+      hasSessionDraftChanges(
+        sessionListDraft,
+        persistedSessionList,
+        sessionFallbackTaskType,
+      ),
+    [persistedSessionList, selected, sessionFallbackTaskType, sessionListDraft],
+  );
+
+  const hydrateSessionDraftState = (
+    modelName: string,
+    taskDetail: TaskFromDB | null,
+    modelRuns: ModelRunFromDB[],
+    selectedTask: Task | null,
+  ) => {
+    const fallbackTaskType =
+      taskDetail?.taskType ??
+      selectedTask?.taskType ??
+      availableTaskTypes[0] ??
+      DEFAULT_TASK_TYPE;
+    const nextPersistedSessionList =
+      modelRuns.find((run) => run.modelName === modelName)?.sessionList ??
+      taskDetail?.sessionList ??
+      selectedTask?.sessionList ??
+      null;
+    const hydratedSessions = hydrateSessionDrafts(
+      nextPersistedSessionList,
+      fallbackTaskType,
+    );
+    sessionDraftVersionRef.current = 0;
+    setSessionListDraft(hydratedSessions);
+    setSessionExtractCandidates([]);
+    setOpenSessionEditors(buildSessionEditorOpenSet(hydratedSessions));
+    setCopiedSessionId(null);
+    setSessionSaveState('idle');
+  };
+
+  const setTaskPromptGenerating = (taskId: string, isGenerating: boolean) => {
+    setPromptGeneratingTaskIds((prev) => {
+      const next = new Set(prev);
+      if (isGenerating) {
+        next.add(taskId);
+      } else {
+        next.delete(taskId);
+      }
+      return next;
+    });
+  };
+
+  const patchTaskSummaryState = (taskId: string, patch: Partial<Task>) => {
+    setSelected((prev) =>
+      prev?.id === taskId ? { ...prev, ...patch } : prev,
+    );
+    useAppStore.setState((state) => ({
+      tasks: state.tasks.map((task) =>
+        task.id === taskId ? { ...task, ...patch } : task,
+      ),
+    }));
+  };
+
+  const refreshTaskSessionSyncState = async (taskId: string) => {
+    const [taskDetail, taskReadme, modelRuns, aiReviewRounds, codePushRecords] = await Promise.all([
+      getTask(taskId),
+      getTaskReadme(taskId),
+      listModelRuns(taskId),
+      listAiReviewRounds(taskId),
+      listCodePushRecords(taskId),
+    ]);
+    const normalizedModelRuns = normalizeModelRunList(modelRuns);
+    const normalizedAiReviewRounds = normalizeAiReviewRoundList(aiReviewRounds);
+    const normalizedTaskReadme = normalizeTaskReadme(taskReadme);
+
+    if (selectedTaskIdRef.current !== taskId) {
+      return;
+    }
+
+    const latestTask =
+      useAppStore.getState().tasks.find((task) => task.id === taskId) ??
+      selected ??
+      null;
+
+    if (latestTask) {
+      setSelected((prev) => (prev?.id === taskId ? latestTask : prev));
+    }
+
+    setSelectedTaskDetail(taskDetail);
+    setSelectedTaskReadme(normalizedTaskReadme);
+    setSelectedModelRuns(normalizedModelRuns);
+    setSelectedAiReviewRounds(normalizedAiReviewRounds);
+    setSelectedCodePushRecords(Array.isArray(codePushRecords) ? codePushRecords : []);
+    const nextSessionModelName =
+      normalizedModelRuns.some((run) => run.modelName === selectedSessionModelName)
+        ? selectedSessionModelName
+        : buildSessionModelOptions(normalizedModelRuns, sourceModelName)[0]?.modelName ?? '';
+    setSelectedSessionModelName(nextSessionModelName);
+    hydrateSessionDraftState(
+      nextSessionModelName,
+      taskDetail,
+      normalizedModelRuns,
+      latestTask,
+    );
+  };
+
+  useEffect(() => {
+    selectedTaskIdRef.current = selected?.id ?? null;
+  }, [selected?.id]);
+
+  useEffect(() => {
+    if (!selected || sessionModelOptions.length === 0) {
+      setSelectedSessionModelName('');
+      return;
+    }
+    if (
+      sessionModelOptions.some(
+        (option) => option.modelName === selectedSessionModelName,
+      )
+    ) {
+      return;
+    }
+    setSelectedSessionModelName(sessionModelOptions[0].modelName);
+  }, [selected, selectedSessionModelName, sessionModelOptions]);
+
+  useEffect(() => {
+    if (!selected?.id) {
+      sessionDraftVersionRef.current = 0;
+      setSelectedTaskDetail(null);
+      setSelectedTaskReadme(null);
+      setSelectedModelRuns([]);
+      setSelectedAiReviewRounds([]);
+      setSelectedCodePushRecords([]);
+      setCodePushActionKey(null);
+      setSelectedSessionModelName('');
+      setDrawerError('');
+      setSessionExtracting(false);
+      setPromptDraft('');
+      setSessionListDraft([]);
+      setSessionExtractCandidates([]);
+      setOpenSessionEditors(new Set());
+      setCopiedSessionId(null);
+      setSessionSaveState('idle');
+      setActiveDrawerTab(getDefaultTaskDetailTab());
+      return;
+    }
+
+    let cancelled = false;
+    setActiveDrawerTab(getDefaultTaskDetailTab());
+    setDrawerLoading(true);
+    setDrawerError('');
+    setSessionExtracting(false);
+
+    (async () => {
+      const [taskDetail, taskReadme, modelRuns, aiReviewRounds, codePushRecords] = await Promise.all([
+        getTask(selected.id),
+        getTaskReadme(selected.id),
+        listModelRuns(selected.id),
+        listAiReviewRounds(selected.id),
+        listCodePushRecords(selected.id),
+      ]);
+      const normalizedModelRuns = normalizeModelRunList(modelRuns);
+      const normalizedAiReviewRounds = normalizeAiReviewRoundList(aiReviewRounds);
+      const normalizedTaskReadme = normalizeTaskReadme(taskReadme);
+      if (cancelled) {
+        return;
+      }
+
+      setSelectedTaskDetail(taskDetail);
+      setSelectedTaskReadme(normalizedTaskReadme);
+      setPromptDraft(taskDetail?.promptText ?? '');
+      setPromptCopied(false);
+      setSelectedModelRuns(normalizedModelRuns);
+      setSelectedAiReviewRounds(normalizedAiReviewRounds);
+      setSelectedCodePushRecords(Array.isArray(codePushRecords) ? codePushRecords : []);
+      const initialSessionModelName =
+        buildSessionModelOptions(normalizedModelRuns, sourceModelName)[0]?.modelName ?? '';
+      setSelectedSessionModelName(initialSessionModelName);
+      hydrateSessionDraftState(
+        initialSessionModelName,
+        taskDetail,
+        normalizedModelRuns,
+        selected,
+      );
+      setDrawerLoading(false);
+    })().catch((error) => {
+      if (cancelled) {
+        return;
+      }
+      setDrawerError(error instanceof Error ? error.message : '详情加载失败');
+      setDrawerLoading(false);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selected?.id, sourceModelName]);
+
+  const handleStatusChange = async (taskId: string, newStatus: TaskStatus) => {
+    setStatusChanging(true);
+    try {
+      const previousStatus =
+        selectedTaskDetail?.id === taskId
+          ? selectedTaskDetail.status
+          : selected?.id === taskId
+            ? selected.status
+            : useAppStore.getState().tasks.find((task) => task.id === taskId)?.status;
+      await updateTaskStatus(taskId, newStatus);
+      updateTaskStatusInStore(taskId, newStatus);
+      setSelected((prev) =>
+        prev?.id === taskId ? { ...prev, status: newStatus } : prev,
+      );
+      setSelectedTaskDetail((prev) =>
+        prev?.id === taskId ? { ...prev, status: newStatus } : prev,
+      );
+      if (newStatus === 'ExecutionCompleted' && previousStatus !== 'ExecutionCompleted') {
+        if (selectedTaskIdRef.current === taskId) {
+          setActiveDrawerTab('sessions');
+          setSessionExtracting(true);
+          setDrawerError('');
+        }
+        await submitSessionSyncJob(taskId);
+        useAppStore.getState().loadBackgroundJobs();
+      }
+    } catch (error) {
+      if (selectedTaskIdRef.current === taskId) {
+        setSessionExtracting(false);
+        setDrawerError(error instanceof Error ? error.message : '状态更新失败');
+      }
+      console.error('Failed to update task status:', error);
+    } finally {
+      setStatusChanging(false);
+    }
+  };
+
+  const handleSessionSyncEvent = async (event: JobProgressEvent) => {
+    if (event.jobType !== 'session_sync') {
+      return;
+    }
+
+    const taskId = event.taskId ?? '';
+    if (!taskId || selectedTaskIdRef.current !== taskId) {
+      return;
+    }
+
+    if (event.status === 'running') {
+      setActiveDrawerTab('sessions');
+      setSessionExtracting(true);
+      setDrawerError('');
+      return;
+    }
+
+    if (event.status === 'done') {
+      setSessionExtracting(false);
+      setDrawerError('');
+      try {
+        await refreshTaskSessionSyncState(taskId);
+      } catch (error) {
+        setDrawerError(
+          error instanceof Error ? error.message : 'Session 同步完成，但详情刷新失败',
+        );
+      }
+      return;
+    }
+
+    if (event.status === 'error') {
+      setSessionExtracting(false);
+      setDrawerError(event.errorMessage ?? 'Session 同步失败');
+      return;
+    }
+
+    if (event.status === 'cancelled') {
+      setSessionExtracting(false);
+    }
+  };
+
+  const handleResetAiReview = async () => {
+    if (!selected?.id || aiReviewResetting) {
+      return;
+    }
+    const confirmed = window.confirm('确认重置当前题卡的全部 AI 复审记录？提示词、Session 和代码目录不会被删除。');
+    if (!confirmed) {
+      return;
+    }
+
+    setAiReviewResetting(true);
+    setDrawerError('');
+    try {
+      await resetTaskAiReview(selected.id);
+      await Promise.all([
+        loadTasks(),
+        useAppStore.getState().loadBackgroundJobs(),
+      ]);
+      await refreshTaskSessionSyncState(selected.id);
+      setActiveDrawerTab('ai-review');
+    } catch (error) {
+      setDrawerError(error instanceof Error ? error.message : '重置复审失败');
+    } finally {
+      setAiReviewResetting(false);
+    }
+  };
+
+  const handleResetAiReviewRound = async (roundId: string) => {
+    if (!roundId || aiReviewResetting) {
+      return;
+    }
+
+    setAiReviewResetting(true);
+    setDrawerError('');
+    try {
+      await resetAiReviewRound(roundId);
+      if (!selected?.id) {
+        return;
+      }
+      await Promise.all([
+        loadTasks(),
+        useAppStore.getState().loadBackgroundJobs(),
+      ]);
+      await refreshTaskSessionSyncState(selected.id);
+      setActiveDrawerTab('ai-review');
+    } catch (error) {
+      setDrawerError(error instanceof Error ? error.message : '重置复审轮次失败');
+    } finally {
+      setAiReviewResetting(false);
+    }
+  };
+
+  const refreshTaskTypeChangeState = async (
+    taskId: string,
+    shouldRefreshDetail: boolean,
+  ) => {
+    if (!shouldRefreshDetail) {
+      await Promise.all([loadActiveProject(), loadTasks()]);
+      return;
+    }
+
+    const [_, __, taskDetail, taskReadme, modelRuns, aiReviewRounds, codePushRecords] = await Promise.all([
+      loadActiveProject(),
+      loadTasks(),
+      getTask(taskId),
+      getTaskReadme(taskId),
+      listModelRuns(taskId),
+      listAiReviewRounds(taskId),
+      listCodePushRecords(taskId),
+    ]);
+    const normalizedModelRuns = normalizeModelRunList(modelRuns);
+    const normalizedAiReviewRounds = normalizeAiReviewRoundList(aiReviewRounds);
+    const normalizedTaskReadme = normalizeTaskReadme(taskReadme);
+
+    const latestTask =
+      useAppStore.getState().tasks.find((task) => task.id === taskId) ?? null;
+    if (latestTask) {
+      setSelected((prev) => (prev?.id === taskId ? latestTask : prev));
+    }
+
+    setSelectedTaskDetail(taskDetail);
+    setSelectedTaskReadme(normalizedTaskReadme);
+    setSelectedModelRuns(normalizedModelRuns);
+    setSelectedAiReviewRounds(normalizedAiReviewRounds);
+    setSelectedCodePushRecords(Array.isArray(codePushRecords) ? codePushRecords : []);
+    const nextSessionModelName =
+      normalizedModelRuns.some((run) => run.modelName === selectedSessionModelName)
+        ? selectedSessionModelName
+        : buildSessionModelOptions(normalizedModelRuns, sourceModelName)[0]?.modelName ?? '';
+    setSelectedSessionModelName(nextSessionModelName);
+    hydrateSessionDraftState(
+      nextSessionModelName,
+      taskDetail,
+      normalizedModelRuns,
+      latestTask,
+    );
+  };
+
+  const handleTaskTypeChange = async (
+    taskId: string,
+    nextTaskType: string,
+    options?: {
+      skipConfirm?: boolean;
+    },
+  ) => {
+    const normalizedTaskType = normalizeTaskTypeName(nextTaskType);
+    const taskFromStore = tasks.find((task) => task.id === taskId);
+    const targetTask =
+      taskFromStore ?? (selected?.id === taskId ? selected : null);
+    const isSelectedTask = selected?.id === taskId;
+    const currentTaskType =
+      normalizeTaskTypeName(
+        isSelectedTask ? primaryTaskType : taskFromStore?.taskType ?? '',
+      ) || (isSelectedTask ? primaryTaskType : taskFromStore?.taskType ?? '');
+
+    if (
+      !normalizedTaskType ||
+      !currentTaskType ||
+      normalizedTaskType === currentTaskType
+    ) {
+      return {
+        ok: false,
+        error: '',
+      };
+    }
+
+    const taskTypeLimit = getTaskTypeQuotaRawValue(
+      projectTaskTypeQuotas,
+      normalizedTaskType,
+    );
+    const existingTaskCount =
+      targetTask === null
+        ? 0
+        : tasks.filter(
+            (task) =>
+              task.id !== taskId &&
+              task.projectId === targetTask.projectId &&
+              normalizeTaskTypeName(task.taskType) === normalizedTaskType,
+          ).length;
+    if (
+      taskTypeLimit !== null &&
+      taskTypeLimit > 0 &&
+      existingTaskCount >= taskTypeLimit
+    ) {
+      const message = buildTaskTypeLimitReachedMessage(
+        normalizedTaskType,
+        taskTypeLimit,
+        existingTaskCount,
+      );
+      if (isSelectedTask) {
+        setDrawerError(message);
+      }
+      return {
+        ok: false,
+        error: message,
+      };
+    }
+
+    if (
+      !options?.skipConfirm &&
+      !window.confirm(
+        buildTaskTypeChangeConfirmMessage(
+          currentTaskType,
+          normalizedTaskType,
+        ),
+      )
+    ) {
+      return {
+        ok: false,
+        error: '',
+      };
+    }
+
+    const previousTaskType = taskFromStore?.taskType ?? currentTaskType;
+    const previousSelected = selected;
+    const previousTaskDetail = selectedTaskDetail;
+    const previousSessionListDraft = sessionListDraft;
+    if (isSelectedTask) {
+      setDrawerError('');
+    }
+
+    updateTaskTypeInStore(taskId, normalizedTaskType);
+
+    if (isSelectedTask) {
+      setSelected((prev) =>
+        prev?.id === taskId
+          ? { ...prev, taskType: normalizedTaskType }
+          : prev,
+      );
+      setSelectedTaskDetail((prev) => {
+        if (!prev || prev.id !== taskId) {
+          return prev;
+        }
+
+        const nextSessionList =
+          prev.sessionList.length > 0
+            ? prev.sessionList.map((session, index) =>
+                index === 0
+                  ? { ...session, taskType: normalizedTaskType }
+                  : session,
+              )
+            : prev.sessionList;
+
+        return {
+          ...prev,
+          taskType: normalizedTaskType,
+          sessionList: nextSessionList,
+        };
+      });
+      setSessionListDraft((prev) =>
+        prev.map((session, index) =>
+          index === 0 ? { ...session, taskType: normalizedTaskType } : session,
+        ),
+      );
+      setSessionSaveState('idle');
+      setDrawerError('');
+    }
+
+    setTaskTypeChanging(true);
+    let updateError: unknown = null;
+    let refreshError: unknown = null;
+    let result: { ok: boolean; error: string } = {
+      ok: true,
+      error: '',
+    };
+
+    try {
+      await updateTaskType(taskId, normalizedTaskType);
+    } catch (error) {
+      updateError = error;
+    }
+
+    try {
+      await refreshTaskTypeChangeState(taskId, isSelectedTask);
+    } catch (error) {
+      refreshError = error;
+    }
+
+    if (updateError) {
+      if (refreshError) {
+        updateTaskTypeInStore(taskId, previousTaskType);
+        if (isSelectedTask) {
+          setSelected(previousSelected);
+          setSelectedTaskDetail(previousTaskDetail);
+          setSessionListDraft(previousSessionListDraft);
+        }
+      }
+
+      const message = humanizeTaskTypeChangeError(
+        updateError,
+        normalizedTaskType,
+        existingTaskCount,
+        taskTypeLimit,
+      );
+      if (isSelectedTask) {
+        setDrawerError(message);
+      } else {
+        console.error('Failed to update task type:', updateError);
+      }
+      result = {
+        ok: false,
+        error: message,
+      };
+      setTaskTypeChanging(false);
+      return result;
+    } else if (refreshError) {
+      console.error('Failed to refresh task type change state:', refreshError);
+      if (isSelectedTask) {
+        setDrawerError(
+          '任务类型已更新，但详情刷新失败，请重新打开题卡查看最新状态',
+        );
+      }
+      result = {
+        ok: true,
+        error:
+          '任务类型已更新，但详情刷新失败，请重新打开题卡查看最新状态',
+      };
+      setTaskTypeChanging(false);
+      return result;
+    }
+
+    setTaskTypeChanging(false);
+    return result;
+  };
+
+  const handlePromptSave = async () => {
+    if (!selected?.id) {
+      return;
+    }
+    if (!promptDraft.trim()) {
+      setDrawerError('提示词不能为空');
+      return;
+    }
+
+    setPromptSaving(true);
+    setDrawerError('');
+    try {
+      await saveTaskPrompt(selected.id, promptDraft);
+      const now = Math.floor(Date.now() / 1000);
+      const nextStatus = resolvePromptWritebackStatus(
+        selectedTaskDetail?.status ?? selected.status,
+      );
+      setSelectedTaskDetail((prev) =>
+        prev
+          ? {
+              ...prev,
+              promptText: promptDraft,
+              status: nextStatus,
+              promptGenerationStatus: 'done',
+              promptGenerationError: null,
+              promptGenerationStartedAt:
+                prev.promptGenerationStartedAt ?? now,
+              promptGenerationFinishedAt: now,
+            }
+          : prev,
+      );
+      setSelected((prev) =>
+        prev
+          ? {
+              ...prev,
+              status: nextStatus,
+              promptGenerationStatus: 'done' as PromptGenerationStatus,
+              promptGenerationError: null,
+            }
+          : prev,
+      );
+      updateTaskStatusInStore(selected.id, nextStatus);
+      await loadTasks();
+    } catch (error) {
+      setDrawerError(error instanceof Error ? error.message : '提示词保存失败');
+    } finally {
+      setPromptSaving(false);
+    }
+  };
+
+  const handlePromptCopy = async () => {
+    if (!promptDraft.trim()) {
+      return;
+    }
+    await writeClipboardText(promptDraft);
+    setPromptCopied(true);
+    window.setTimeout(() => setPromptCopied(false), 1500);
+  };
+
+  const handlePromptDraftChange = (value: string) => {
+    setPromptDraft(value);
+  };
+
+  const handlePromptReset = () => {
+    setPromptDraft(selectedTaskDetail?.promptText ?? '');
+  };
+
+  useEffect(() => {
+    getLlmProviders()
+      .then((providers) => setLlmProviders(normalizeLlmProviderList(providers)))
+      .catch(() => setLlmProviders([]));
+  }, []);
+
+  const handleGeneratePrompt = async (config: Omit<GeneratePromptRequest, 'taskId'>) => {
+    const taskId = selected?.id;
+    if (!taskId) return;
+
+    setTaskPromptGenerating(taskId, true);
+    setDrawerError('');
+
+    const inputPayload = JSON.stringify({ taskId, ...config });
+
+    try {
+      await submitJob({
+        jobType: 'prompt_generate',
+        taskId,
+        inputPayload,
+        timeoutSeconds: PROMPT_GENERATION_TIMEOUT_MS / 1000,
+      });
+      const now = Math.floor(Date.now() / 1000);
+      setSelectedTaskDetail((prev) =>
+        prev?.id === taskId
+          ? {
+              ...prev,
+              promptGenerationStatus: 'running',
+              promptGenerationError: null,
+              promptGenerationStartedAt: prev.promptGenerationStartedAt ?? now,
+              promptGenerationFinishedAt: null,
+            }
+          : prev,
+      );
+      patchTaskSummaryState(taskId, {
+        promptGenerationStatus: 'running',
+        promptGenerationError: null,
+      });
+      useAppStore.getState().loadBackgroundJobs();
+    } catch (submitErr) {
+      if (selectedTaskIdRef.current === taskId) {
+        setDrawerError(
+          submitErr instanceof Error ? submitErr.message : '提交后台任务失败',
+        );
+      }
+      setTaskPromptGenerating(taskId, false);
+      return;
+    }
+
+    // Poll task detail until prompt generation completes
+    let safetyTimeout = 0;
+    const pollInterval = window.setInterval(async () => {
+      try {
+        const taskDetail = await getTask(taskId);
+        if (!taskDetail) return;
+
+        const status = normalizePromptGenerationStatus(taskDetail.promptGenerationStatus);
+        if (status === 'done') {
+          window.clearInterval(pollInterval);
+          window.clearTimeout(safetyTimeout);
+          if (selectedTaskIdRef.current === taskId) {
+            setPromptDraft(taskDetail.promptText ?? '');
+            setSelectedTaskDetail(taskDetail);
+          }
+          const nextStatus = resolvePromptWritebackStatus(taskDetail.status);
+          patchTaskSummaryState(taskId, {
+            status: nextStatus,
+            promptGenerationStatus: 'done' as PromptGenerationStatus,
+            promptGenerationError: null,
+          });
+          updateTaskStatusInStore(taskId, nextStatus);
+          setTaskPromptGenerating(taskId, false);
+          await loadTasks();
+          useAppStore.getState().loadBackgroundJobs();
+        } else if (status === 'error') {
+          window.clearInterval(pollInterval);
+          window.clearTimeout(safetyTimeout);
+          if (selectedTaskIdRef.current === taskId) {
+            setSelectedTaskDetail(taskDetail);
+            setDrawerError(taskDetail.promptGenerationError ?? '提示词生成失败');
+          }
+          patchTaskSummaryState(taskId, {
+            promptGenerationStatus: 'error' as PromptGenerationStatus,
+            promptGenerationError: taskDetail.promptGenerationError,
+          });
+          setTaskPromptGenerating(taskId, false);
+          await loadTasks();
+          useAppStore.getState().loadBackgroundJobs();
+        }
+      } catch {
+        // ignore poll errors
+      }
+    }, 1500);
+
+    // Safety: stop polling after the background job timeout window.
+    safetyTimeout = window.setTimeout(() => {
+      window.clearInterval(pollInterval);
+      if (selectedTaskIdRef.current === taskId) {
+        setDrawerError('提示词生成等待超时，请查看后台任务面板或重试');
+      }
+      setTaskPromptGenerating(taskId, false);
+    }, PROMPT_GENERATION_TIMEOUT_MS);
+  };
+
+  const handleAddSession = () => {
+    const fallbackTaskType =
+      sessionListDraft[sessionListDraft.length - 1]?.taskType ||
+      selectedTaskDetail?.taskType ||
+      selected?.taskType ||
+      availableTaskTypes[0] ||
+      DEFAULT_TASK_TYPE;
+
+    const nextSession = createSessionDraft(fallbackTaskType, {
+      taskType: fallbackTaskType,
+      consumeQuota: false,
+      isCompleted: true,
+      isSatisfied: true,
+      evaluation: '',
+    });
+    sessionDraftVersionRef.current += 1;
+    setSessionListDraft((prev) => [...prev, nextSession]);
+    setOpenSessionEditors((prev) => new Set(prev).add(nextSession.localId));
+    setSessionSaveState('idle');
+  };
+
+  const commitCurrentSessionCode = async (
+    run: ModelRunFromDB,
+    sessionId: string,
+    sessionIndex: number,
+  ): Promise<boolean> => {
+    if (!selected?.id) {
+      return false;
+    }
+
+    const actionKey = `commit-${run.id}`;
+    setCodePushActionKey(actionKey);
+    setDrawerError('');
+    try {
+      const record = await commitCode({
+        taskId: selected.id,
+        modelRunId: run.id,
+        sessionId,
+        sessionIndex,
+      });
+      setSelectedCodePushRecords((prev) => [
+        record,
+        ...prev.filter((item) => item.id !== record.id),
+      ]);
+      return true;
+    } catch (error) {
+      setDrawerError(error instanceof Error ? error.message : '提交代码失败');
+      return false;
+    } finally {
+      setCodePushActionKey(null);
+    }
+  };
+
+  const handleCompleteCurrentSessionAndAdd = async () => {
+    const run = selectedSessionModelRun;
+    if (!run) {
+      setDrawerError('当前模型没有可提交的执行目录');
+      return;
+    }
+    if (!run.localPath?.trim()) {
+      setDrawerError('当前模型缺少本地目录，不能提交代码');
+      return;
+    }
+
+    const currentSession = sessionListDraft[sessionListDraft.length - 1] ?? null;
+    const sessionId = currentSession?.sessionId?.trim() ?? '';
+    const sessionIndex = Math.max(sessionListDraft.length - 1, 0);
+    if (!sessionId) {
+      setDrawerError(`第 ${sessionIndex + 1} 轮还没有 sessionId，请先填写后再完成本轮`);
+      return;
+    }
+
+    const saved = await handleSessionListSave({
+      skipIfUnchanged: true,
+      modelRunId: run.id,
+    });
+    if (!saved) {
+      return;
+    }
+
+    if (currentSession?.evidence?.matchKind === 'claude_code') {
+      handleAddSession();
+      return;
+    }
+
+    const existingRecord = selectedCodePushRecords.find(
+      (record) => record.modelRunId === run.id && record.sessionId === sessionId,
+    );
+    if (existingRecord) {
+      handleAddSession();
+      return;
+    }
+
+    const confirmMessage =
+      `当前第 ${sessionIndex + 1} 轮已有 sessionId，但还没有提交代码。\n\n` +
+      '点击“确定”会先提交当前轮代码，提交成功后新增下一轮。\n' +
+      '点击“取消”后可以选择是否仅新增下一轮。';
+    if (window.confirm(confirmMessage)) {
+      const committed = await commitCurrentSessionCode(run, sessionId, sessionIndex);
+      if (!committed) {
+        return;
+      }
+    } else if (!window.confirm('不提交当前轮代码，直接新增下一轮？')) {
+      return;
+    }
+
+    handleAddSession();
+  };
+
+  const handleSessionChange = (
+    localId: string,
+    patch: Partial<
+      Pick<
+        EditableTaskSession,
+        | 'sessionId'
+        | 'taskType'
+        | 'consumeQuota'
+        | 'isCompleted'
+        | 'isSatisfied'
+        | 'evaluation'
+        | 'userConversation'
+      >
+    >,
+  ) => {
+    sessionDraftVersionRef.current += 1;
+    setSessionListDraft((prev) =>
+      prev.map((session, index) => {
+        if (session.localId !== localId) {
+          return session;
+        }
+        return {
+          ...session,
+          ...patch,
+          consumeQuota:
+            index === 0 ? true : patch.consumeQuota ?? session.consumeQuota,
+        };
+      }),
+    );
+    setSessionSaveState('idle');
+  };
+
+  const handleSessionListSave = async (options?: {
+    drafts?: EditableTaskSession[];
+    skipIfUnchanged?: boolean;
+    modelRunId?: string | null;
+  }) => {
+    if (!selected?.id || sessionListSaving) {
+      return false;
+    }
+
+    const draftToSave = options?.drafts ?? sessionListDraft;
+    const targetModelRunId =
+      options?.modelRunId ?? selectedSessionModelRun?.id ?? null;
+    if (
+      options?.skipIfUnchanged &&
+      !hasSessionDraftChanges(
+        draftToSave,
+        persistedSessionList,
+        sessionFallbackTaskType,
+      )
+    ) {
+      return true;
+    }
+
+    if (draftToSave.length === 0) {
+      setDrawerError('至少保留一个 session');
+      return false;
+    }
+
+    for (let index = 0; index < draftToSave.length; index += 1) {
+      const session = draftToSave[index];
+      if (session.isCompleted === null || session.isCompleted === undefined) {
+        setDrawerError(`第 ${index + 1} 轮请选择是否完成`);
+        return false;
+      }
+      if (session.isSatisfied === null || session.isSatisfied === undefined) {
+        setDrawerError(`第 ${index + 1} 轮请选择是否满意`);
+        return false;
+      }
+    }
+
+    const nextSessionList: TaskSessionRecord[] = mapSessionDraftsToSessionList(
+      draftToSave,
+      selected.taskType,
+    );
+    const saveVersion = sessionDraftVersionRef.current;
+
+    setSessionListSaving(true);
+    setDrawerError('');
+    try {
+      await updateTaskSessionList({
+        id: selected.id,
+        modelRunId: targetModelRunId,
+        sessionList: nextSessionList,
+      });
+
+      const nextTaskType = nextSessionList[0]?.taskType ?? selected.taskType;
+      updateTaskTypeInStore(selected.id, nextTaskType);
+      setSelected((prev) =>
+        prev
+          ? {
+              ...prev,
+              taskType: nextTaskType,
+              executionRounds: Math.max(nextSessionList.length, 1),
+            }
+          : prev,
+      );
+      setSelectedTaskDetail((prev) =>
+        prev
+          ? {
+              ...prev,
+              taskType: nextTaskType,
+              sessionList:
+                targetModelRunId === null ? nextSessionList : prev.sessionList,
+            }
+          : prev,
+      );
+      setSelectedModelRuns((prev) =>
+        prev.map((run) =>
+          run.id === targetModelRunId
+            ? {
+                ...run,
+                sessionList: nextSessionList,
+                sessionId:
+                  [...nextSessionList]
+                    .reverse()
+                    .find((session) => session.sessionId.trim())?.sessionId ??
+                  null,
+                conversationRounds: nextSessionList.length,
+                conversationDate: Math.floor(Date.now() / 1000),
+              }
+            : run,
+        ),
+      );
+
+      const hydratedSessions = hydrateSessionDrafts(
+        nextSessionList,
+        nextTaskType,
+      );
+      const shouldSyncDraftState =
+        sessionDraftVersionRef.current === saveVersion;
+
+      if (shouldSyncDraftState) {
+        sessionDraftVersionRef.current = saveVersion;
+        setSessionListDraft(hydratedSessions);
+        setOpenSessionEditors(buildSessionEditorOpenSet(hydratedSessions));
+        setCopiedSessionId(null);
+        setSessionSaveState('saved');
+      } else {
+        setSessionSaveState('idle');
+      }
+
+      await Promise.all([loadTasks(), loadActiveProject()]);
+      if (shouldSyncDraftState) {
+        window.setTimeout(() => setSessionSaveState('idle'), 1600);
+      }
+      return true;
+    } catch (error) {
+      setDrawerError(error instanceof Error ? error.message : 'session 保存失败');
+      return false;
+    } finally {
+      setSessionListSaving(false);
+    }
+  };
+
+  const handleRemoveSession = (localId: string) => {
+    const targetIndex = sessionListDraft.findIndex(
+      (session) => session.localId === localId,
+    );
+    if (targetIndex < 0) {
+      return;
+    }
+
+    if (!window.confirm(`确认删除第 ${targetIndex + 1} 轮 session 吗？`)) {
+      return;
+    }
+
+    const nextDrafts = sessionListDraft
+      .filter((session) => session.localId !== localId)
+      .map((session, index) =>
+        index === 0 ? { ...session, consumeQuota: true } : session,
+      );
+
+    sessionDraftVersionRef.current += 1;
+    setSessionListDraft(nextDrafts);
+    setOpenSessionEditors((prev) => {
+      const next = new Set(prev);
+      next.delete(localId);
+      return next;
+    });
+    setCopiedSessionId((prev) => (prev === localId ? null : prev));
+    setSessionSaveState('idle');
+    void handleSessionListSave({
+      drafts: nextDrafts,
+      modelRunId: selectedSessionModelRun?.id ?? null,
+    });
+  };
+
+  const handleResetSessions = () => {
+    hydrateSessionDraftState(
+      selectedSessionModelName,
+      selectedTaskDetail,
+      selectedModelRuns,
+      selected,
+    );
+  };
+
+  const applyExtractedSessionCandidate = (
+    candidate: ExtractTaskSessionCandidate,
+  ) => {
+    const fallbackTaskType =
+      selectedTaskDetail?.taskType ??
+      selected?.taskType ??
+      availableTaskTypes[0] ??
+      DEFAULT_TASK_TYPE;
+
+    const nextDrafts = buildDraftsFromExtractedCandidate(
+      candidate,
+      sessionListDraft,
+      fallbackTaskType,
+    );
+    if (nextDrafts.length === 0) {
+      setDrawerError('提取结果中没有可用的 session');
+      return;
+    }
+
+    sessionDraftVersionRef.current += 1;
+    setSessionListDraft(nextDrafts);
+    setSessionExtractCandidates([]);
+    setOpenSessionEditors(buildSessionEditorOpenSet(nextDrafts));
+    setCopiedSessionId(null);
+    setSessionSaveState('idle');
+    setDrawerError('');
+  };
+
+  const handleAutoExtractSessions = async () => {
+    if (!selected?.id) {
+      return;
+    }
+
+    setSessionExtracting(true);
+    setSessionExtractCandidates([]);
+    setDrawerError('');
+	    try {
+	      const result = await extractTaskSessions(selected.id);
+	      const isClaudeCodeSource = result.source === 'claude_code';
+	      const scopedCandidates = isClaudeCodeSource
+	        ? result.candidates
+	        : filterCandidatesForModel(
+	          result.candidates,
+	          selectedModelRuns,
+	          selectedSessionModelName,
+	        );
+
+	      if (scopedCandidates.length === 0) {
+	        if (isClaudeCodeSource) {
+	          setDrawerError(result.message || '未采集到 Claude Code 容器轨迹，请先到“容器标注”页面绑定容器并采集 JSONL。');
+	          return;
+	        }
+	        if (selectedSessionModelName) {
+	          setDrawerError(
+	            `未在 Trae 中找到与模型 ${selectedSessionModelName} 对应的对话`,
+          );
+        } else {
+          setDrawerError('未在 Trae 中找到与当前题卡匹配的对话');
+        }
+        return;
+      }
+
+      if (scopedCandidates.length === 1) {
+        applyExtractedSessionCandidate(scopedCandidates[0]);
+        return;
+      }
+
+      setSessionExtractCandidates(scopedCandidates);
+    } catch (error) {
+      setDrawerError(
+        error instanceof Error ? error.message : '自动提取 session 失败',
+      );
+    } finally {
+      setSessionExtracting(false);
+    }
+  };
+
+  const toggleSessionEditor = (localId: string) => {
+    setOpenSessionEditors((prev) => {
+      const next = new Set(prev);
+      if (next.has(localId)) {
+        next.delete(localId);
+      } else {
+        next.add(localId);
+      }
+      return next;
+    });
+  };
+
+  const handleSessionModelChange = async (modelName: string) => {
+    if (modelName === selectedSessionModelName) {
+      return;
+    }
+
+    const saved = await handleSessionListSave({
+      skipIfUnchanged: true,
+      modelRunId: selectedSessionModelRun?.id ?? null,
+    });
+    if (!saved) {
+      return;
+    }
+
+    setSelectedSessionModelName(modelName);
+    hydrateSessionDraftState(
+      modelName,
+      selectedTaskDetail,
+      selectedModelRuns,
+      selected,
+    );
+  };
+
+  const handleCopySessionId = async (localId: string, sessionId: string) => {
+    if (!sessionId.trim()) {
+      return;
+    }
+    await writeClipboardText(sessionId.trim());
+    setCopiedSessionId(localId);
+    window.setTimeout(() => {
+      setCopiedSessionId((current) => (current === localId ? null : current));
+    }, 1500);
+  };
+
+  const refreshCodePushRecords = async (taskId: string) => {
+    const records = await listCodePushRecords(taskId);
+    if (selectedTaskIdRef.current === taskId) {
+      setSelectedCodePushRecords(Array.isArray(records) ? records : []);
+    }
+  };
+
+  const handleCommitCode = async (run: ModelRunFromDB) => {
+    if (!selected?.id) {
+      return;
+    }
+    const resolvedSession = resolveLatestSession(run);
+    if (!resolvedSession) {
+      setDrawerError('当前模型执行还没有可用 sessionId，不能提交代码');
+      return;
+    }
+    const actionKey = `commit-${run.id}`;
+    setCodePushActionKey(actionKey);
+    setDrawerError('');
+    try {
+      const record = await commitCode({
+        taskId: selected.id,
+        modelRunId: run.id,
+        sessionId: resolvedSession.sessionId,
+        sessionIndex: resolvedSession.sessionIndex,
+      });
+      setSelectedCodePushRecords((prev) => [
+        record,
+        ...prev.filter((item) => item.id !== record.id),
+      ]);
+    } catch (error) {
+      setDrawerError(error instanceof Error ? error.message : '提交代码失败');
+    } finally {
+      setCodePushActionKey(null);
+    }
+  };
+
+  const handleRedoCommit = async (record: CodePushRecord) => {
+    const confirmMessage =
+      record.status === 'pushed'
+        ? '这条记录已经推送到 GitHub。重做提交会改写本地 commit，后续重新推送时需要覆盖远端，确认继续？'
+        : '确认用当前目录改动重做这次提交？';
+    if (!window.confirm(confirmMessage)) {
+      return;
+    }
+
+    const actionKey = `redo-${record.id}`;
+    setCodePushActionKey(actionKey);
+    setDrawerError('');
+    try {
+      const nextRecord = await redoCommit({ recordId: record.id });
+      setSelectedCodePushRecords((prev) =>
+        prev.map((item) => (item.id === nextRecord.id ? nextRecord : item)),
+      );
+    } catch (error) {
+      setDrawerError(error instanceof Error ? error.message : '重做提交失败');
+    } finally {
+      setCodePushActionKey(null);
+    }
+  };
+
+  const handlePushCode = async (record: CodePushRecord) => {
+    const forceWithLease = record.status === 'needs_push';
+    if (
+      forceWithLease &&
+      !window.confirm('这次推送会用 --force-with-lease 覆盖远端同名分支，确认推送？')
+    ) {
+      return;
+    }
+
+    const actionKey = `push-${record.id}`;
+    setCodePushActionKey(actionKey);
+    setDrawerError('');
+    try {
+      const nextRecord = await pushCode({
+        recordId: record.id,
+        forceWithLease,
+      });
+      setSelectedCodePushRecords((prev) =>
+        prev.map((item) => (item.id === nextRecord.id ? nextRecord : item)),
+      );
+      if (selected?.id) {
+        void refreshCodePushRecords(selected.id);
+      }
+    } catch (error) {
+      setDrawerError(error instanceof Error ? error.message : '推送 GitHub 失败');
+      if (selected?.id) {
+        void refreshCodePushRecords(selected.id);
+      }
+    } finally {
+      setCodePushActionKey(null);
+    }
+  };
+
+  const handleSessionEditorBlur = async () => {
+    await handleSessionListSave({
+      skipIfUnchanged: true,
+      modelRunId: selectedSessionModelRun?.id ?? null,
+    });
+  };
+
+  const closeSessionExtractCandidates = () => {
+    setSessionExtractCandidates([]);
+  };
+
+  return {
+    selected,
+    setSelected,
+    selectedTaskDetail,
+    selectedTaskReadme,
+    selectedModelRuns,
+    selectedAiReviewRounds,
+    selectedCodePushRecords,
+    codePushActionKey,
+    drawerLoading,
+    drawerError,
+    setDrawerError,
+    statusChanging,
+    taskTypeChanging,
+    aiReviewResetting,
+    sessionListDraft,
+    sessionListSaving,
+    sessionSaveState,
+    hasUnsavedSessionChanges,
+    sessionExtracting,
+    sessionExtractCandidates,
+    openSessionEditors,
+    copiedSessionId,
+    promptDraft,
+    promptSaving,
+    promptSaveState,
+    promptCopied,
+    activeDrawerTab,
+    setActiveDrawerTab,
+    sessionModelOptions,
+    selectedSessionModelName,
+    handleSessionModelChange,
+    sessionTaskTypeOptions,
+    selectedPromptGenerationStatus,
+    selectedPromptGenerationMeta,
+    selectedPromptGenerationError,
+    handleSessionSyncEvent,
+    handleStatusChange,
+    handleTaskTypeChange,
+    handleResetAiReview,
+    handleAddSession,
+    handleCompleteCurrentSessionAndAdd,
+    handleAutoExtractSessions,
+    handleSessionChange,
+    toggleSessionEditor,
+    handleSessionEditorBlur,
+    handleCopySessionId,
+    handleCommitCode,
+    handleRedoCommit,
+    handlePushCode,
+    handleRemoveSession,
+    handleResetSessions,
+    handleSessionListSave,
+    handlePromptDraftChange,
+    handlePromptCopy,
+    handlePromptReset,
+    handlePromptSave,
+    promptGenerating,
+    llmProviders,
+    handleGeneratePrompt,
+    applyExtractedSessionCandidate,
+    closeSessionExtractCandidates,
+    handleResetAiReviewRound,
+    refreshModelRuns: async () => {
+      if (!selected) return;
+      const [runs, rounds] = await Promise.all([
+        listModelRuns(selected.id),
+        listAiReviewRounds(selected.id),
+      ]);
+      setSelectedModelRuns(normalizeModelRunList(runs));
+      setSelectedAiReviewRounds(normalizeAiReviewRoundList(rounds));
+    },
+  };
+}
+
+export type BoardTaskDetailController = ReturnType<typeof useBoardTaskDetail>;

@@ -1,0 +1,43 @@
+version: '3'
+
+tasks:
+  dev:
+    desc: Run development mode
+    cmds:
+      - wails3 dev
+
+  build:
+    desc: Build production binary
+    cmds:
+      - cd frontend && npm run build
+      - go build -o build/bin/pinru .
+
+  generate:
+    desc: Generate Wails bindings
+    cmds:
+      - wails3 generate bindings -d frontend/bindings
+
+  package:
+    desc: Build and package macOS app bundle
+    cmds:
+      - cd frontend && npm run build
+      - go build -o build/bin/pinru .
+      - mkdir -p dist/PINRU.app/Contents/MacOS dist/PINRU.app/Contents/Resources
+      - cp build/bin/pinru dist/PINRU.app/Contents/MacOS/pinru
+      - cp build/darwin/Info.plist dist/PINRU.app/Contents/Info.plist
+      - cp build/darwin/icons.icns dist/PINRU.app/Contents/Resources/icons.icns
+      - codesign --force --deep --sign - dist/PINRU.app
+      - echo "Packaged to dist/PINRU.app"
+
+  dmg:
+    desc: Build and package a macOS DMG installer
+    cmds:
+      - cd frontend && npm run build
+      - go build -o build/bin/pinru .
+      - bash scripts/package_macos_dmg.sh
+
+  clean:
+    desc: Clean build artifacts
+    cmds:
+      - rm -rf build/bin
+      - rm -rf frontend/dist

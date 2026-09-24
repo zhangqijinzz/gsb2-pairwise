@@ -1,0 +1,36 @@
+version: '3'
+
+info:
+  companyName: "PinRu"
+  productName: "PinRu"
+  productIdentifier: "com.blueship581.pinru"
+  description: "AI Model Code Review Workstation"
+  copyright: "(c) 2026, blueship581"
+  comments: "PinRu"
+  version: "0.1.0"
+
+dev_mode:
+  root_path: .
+  log_level: info
+  debounce: 1000
+  ignore:
+    dir:
+      - .git
+      - node_modules
+      - frontend
+      - build/bin
+      - dist
+      - exports
+    file:
+      - .DS_Store
+      - .gitignore
+      - .gitkeep
+    watched_extension:
+      - "*.go"
+    git_ignore: true
+  executes:
+    - cmd: npm run dev -- --host 0.0.0.0 --port 9245 --strictPort
+      dir: frontend
+      type: background
+    - cmd: go run .
+      type: primary

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Coding Agent 满意度做题助手（AI 评价版）"
+  short_description: "接收用户在 Claude Code CLI 执行后的轨迹和产物，自动评分并生成 Excel"
+  default_prompt: "使用 $coding-agent-satisfaction，我已自行准备项目和提示词并在 Claude Code CLI 执行完成，请读取对应轨迹与产物，逐轮评分并生成 Excel 提交表。"

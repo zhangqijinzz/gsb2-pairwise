@@ -1,0 +1,407 @@
+import { callService } from './wails';
+
+export type PromptGenerationStatus = 'idle' | 'running' | 'done' | 'error';
+export type PromptDifficulty = '简单' | '一般' | '困难' | '地狱';
+
+export interface TaskSessionEvidence {
+  workspacePath: string;
+  matchedPath: string;
+  matchKind: string;
+  userId: string;
+  username: string;
+  summary: string;
+  isCurrent: boolean;
+  lastActivityAt: number | null;
+  extractedAt: number | null;
+}
+
+export interface TaskSession {
+  sessionId: string;
+  taskType: string;
+  consumeQuota: boolean;
+  isCompleted?: boolean | null;
+  isSatisfied?: boolean | null;
+  evaluation?: string;
+  userConversation?: string;
+  evidence?: TaskSessionEvidence | null;
+}
+
+export interface ExtractedTraeSession {
+  sessionId: string;
+  userConversation: string;
+  userMessageCount: number;
+  firstUserMessage: string;
+  lastActivityAt: number | null;
+  isCurrent: boolean;
+}
+
+export interface ExtractTaskSessionCandidate {
+  id: string;
+  workspacePath: string;
+  matchedPath: string;
+  matchKind: 'exact' | 'child' | 'parent' | string;
+  sessionCount: number;
+  userId: string;
+  username: string;
+  currentSessionId: string;
+  userMessageCount: number;
+  summary: string;
+  lastActivityAt: number | null;
+  sessions: ExtractedTraeSession[];
+}
+
+export interface ExtractTaskSessionsResult {
+  taskId: string;
+  source?: 'trae' | 'claude_code' | string;
+  message?: string;
+  candidates: ExtractTaskSessionCandidate[];
+}
+
+export interface TaskFromDB {
+  id: string;
+  gitlabProjectId: number;
+  projectName: string;
+  status: string;
+  taskType: string;
+  sessionList: TaskSession[];
+  localPath: string | null;
+  promptText: string | null;
+  promptGenerationStatus: PromptGenerationStatus;
+  promptGenerationError: string | null;
+  promptGenerationStartedAt: number | null;
+  promptGenerationFinishedAt: number | null;
+  promptDifficulty: PromptDifficulty;
+  createdAt: number;
+  updatedAt: number;
+  notes: string | null;
+  projectConfigId: string | null;
+  projectType: string;
+  changeScope: string;
+}
+
+export type ReviewStatus = 'none' | 'running' | 'pass' | 'warning';
+
+export interface ModelRunFromDB {
+  id: string;
+  taskId: string;
+  modelName: string;
+  branchName: string | null;
+  localPath: string | null;
+  prUrl: string | null;
+  originUrl: string | null;
+  gsbScore: string | null;
+  status: string;
+  startedAt: number | null;
+  finishedAt: number | null;
+  sessionId: string | null;
+  conversationRounds: number;
+  conversationDate: number | null;
+  submitError: string | null;
+  sessionList?: TaskSession[];
+  reviewStatus: ReviewStatus;
+  reviewRound: number;
+  reviewNotes: string | null;
+}
+
+export interface AiReviewNodeFromDB {
+  id: string;
+  taskId: string;
+  modelRunId: string | null;
+  parentId: string | null;
+  rootId: string;
+  modelName: string;
+  localPath: string;
+  title: string;
+  issueType: string;
+  level: number;
+  sequence: number;
+  status: ReviewStatus;
+  runCount: number;
+  originalPrompt: string;
+  promptText: string;
+  promptDifficulty: PromptDifficulty;
+  reviewNotes: string;
+  parentReviewNotes: string;
+  nextPrompt: string;
+  isCompleted: boolean | null;
+  isSatisfied: boolean | null;
+  projectType: string;
+  changeScope: string;
+  keyLocations: string;
+  lastJobId: string | null;
+  isActive: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface AiReviewRoundFromDB {
+  id: string;
+  taskId: string;
+  modelRunId: string | null;
+  localPath: string;
+  modelName: string;
+  roundNumber: number;
+  originalPrompt: string;
+  promptText: string;
+  promptDifficulty: PromptDifficulty;
+  status: ReviewStatus;
+  isCompleted: boolean | null;
+  isSatisfied: boolean | null;
+  reviewNotes: string;
+  dissatisfactionSummary: string;
+  nextPrompt: string;
+  nextPromptTaskType: string;
+  projectType: string;
+  changeScope: string;
+  keyLocations: string;
+  jobId: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface TaskChildDirectory {
+  name: string;
+  path: string;
+  modelRunId: string | null;
+  modelName: string | null;
+  reviewStatus: ReviewStatus;
+  reviewRound: number;
+  reviewNotes: string | null;
+  isSource: boolean;
+}
+
+export interface TaskReadme {
+  path: string;
+  content: string;
+}
+
+export interface CreateTaskRequest {
+  gitlabProjectId: number;
+  projectName: string;
+  taskType?: string;
+  claimSequence?: number | null;
+  localPath: string | null;
+  sourceModelName?: string | null;
+  sourceLocalPath?: string | null;
+  models: string[];
+  projectConfigId?: string | null;
+}
+
+export interface CreateTasksFromCustomPromptDocumentsRequest {
+  projectId: string;
+  documentPaths: string[];
+}
+
+export interface CustomPromptDocumentTaskDetail {
+  projectName: string;
+  taskId: string;
+  questionId: number;
+  taskType: string;
+  promptDifficulty: PromptDifficulty;
+  claimSequence: number;
+  localPath: string;
+  status: string;
+  message: string;
+}
+
+export interface CustomPromptDocumentCreateDetail {
+  documentPath: string;
+  projectName: string;
+  parsedCount: number;
+  createdCount: number;
+  errorCount: number;
+  status: string;
+  message: string;
+  tasks: CustomPromptDocumentTaskDetail[];
+}
+
+export interface CreateTasksFromCustomPromptDocumentsResult {
+  projectId: string;
+  createdCount: number;
+  errorCount: number;
+  documentCount: number;
+  details: CustomPromptDocumentCreateDetail[];
+}
+
+export interface UpdateModelRunRequest {
+  taskId: string;
+  modelName: string;
+  status: string;
+  branchName?: string | null;
+  prUrl?: string | null;
+  startedAt?: number | null;
+  finishedAt?: number | null;
+}
+
+export interface SoloProjectXlsxExportResult {
+  projectName: string;
+  outputPath: string;
+  validationPath: string;
+  rows: number;
+  validationRows: number;
+  duplicateSessions: number;
+  emptyRepoUrl: number;
+  emptyCommit: number;
+  missingPrRecords: number;
+  repoUrlFilled: number;
+}
+
+export async function listTasks(projectConfigId?: string): Promise<TaskFromDB[]> {
+  return callService('TaskService', 'ListTasks', projectConfigId ?? null);
+}
+
+export async function getTask(id: string): Promise<TaskFromDB | null> {
+  return callService('TaskService', 'GetTask', id);
+}
+
+export async function listModelRuns(taskId: string): Promise<ModelRunFromDB[]> {
+  return callService('TaskService', 'ListModelRuns', taskId);
+}
+
+export async function listAiReviewNodes(taskId: string): Promise<AiReviewNodeFromDB[]> {
+  return callService('TaskService', 'ListAiReviewNodes', taskId);
+}
+
+export async function listAiReviewRounds(taskId: string): Promise<AiReviewRoundFromDB[]> {
+  return callService('TaskService', 'ListAiReviewRounds', taskId);
+}
+
+export async function resetTaskAiReview(taskId: string): Promise<void> {
+  return callService('TaskService', 'ResetTaskAiReview', taskId);
+}
+
+export async function resetAiReviewRound(roundId: string): Promise<void> {
+  return callService('TaskService', 'ResetAiReviewRound', roundId);
+}
+
+export async function saveAiReviewRoundNotes(
+  roundID: string,
+  reviewNotes: string,
+  nextPrompt: string,
+  nextPromptTaskType: string,
+): Promise<void> {
+  return callService('TaskService', 'SaveAiReviewRoundNotes', roundID, reviewNotes, nextPrompt, nextPromptTaskType);
+}
+
+export async function saveAiReviewRoundDissatisfactionSummary(
+  roundID: string,
+  dissatisfactionSummary: string,
+): Promise<void> {
+  return callService('TaskService', 'SaveAiReviewRoundDissatisfactionSummary', roundID, dissatisfactionSummary);
+}
+
+export async function listTaskChildDirectories(taskId: string): Promise<TaskChildDirectory[]> {
+  return callService('TaskService', 'ListTaskChildDirectories', taskId);
+}
+
+export async function getTaskReadme(taskId: string): Promise<TaskReadme | null> {
+  return callService('TaskService', 'GetTaskReadme', taskId);
+}
+
+export async function createTask(task: CreateTaskRequest): Promise<TaskFromDB> {
+  return callService('TaskService', 'CreateTask', task);
+}
+
+export async function pickCustomPromptDocuments(): Promise<string[]> {
+  const result = (await callService('TaskService', 'PickCustomPromptDocuments')) as string[] | null;
+  return result ?? [];
+}
+
+export async function createTasksFromCustomPromptDocuments(
+  request: CreateTasksFromCustomPromptDocumentsRequest,
+): Promise<CreateTasksFromCustomPromptDocumentsResult> {
+  return callService('TaskService', 'CreateTasksFromCustomPromptDocuments', request);
+}
+
+export async function updateTaskStatus(id: string, status: string): Promise<void> {
+  return callService('TaskService', 'UpdateTaskStatus', id, status);
+}
+
+export async function updateTaskType(id: string, taskType: string): Promise<void> {
+  return callService('TaskService', 'UpdateTaskType', id, taskType);
+}
+
+export interface UpdateTaskSessionListRequest {
+  id: string;
+  modelRunId?: string | null;
+  sessionList: TaskSession[];
+}
+
+export async function updateTaskSessionList(req: UpdateTaskSessionListRequest): Promise<void> {
+  return callService('TaskService', 'UpdateTaskSessionList', req);
+}
+
+export async function extractTaskSessions(taskId: string): Promise<ExtractTaskSessionsResult> {
+  return callService('TaskService', 'ExtractTaskSessions', taskId);
+}
+
+export async function updateModelRun(request: UpdateModelRunRequest): Promise<void> {
+  return callService('TaskService', 'UpdateModelRun', request);
+}
+
+export async function exportSoloProjectXlsx(projectName: string): Promise<SoloProjectXlsxExportResult> {
+  return callService('TaskService', 'ExportSoloProjectXlsx', projectName);
+}
+
+export async function deleteTask(id: string): Promise<void> {
+  return callService('TaskService', 'DeleteTask', id);
+}
+
+export async function openTaskLocalFolder(id: string): Promise<void> {
+  return callService('TaskService', 'OpenTaskLocalFolder', id);
+}
+
+export interface UpdateModelRunSessionRequest {
+  id: string;
+  sessionId?: string | null;
+  conversationRounds: number;
+  conversationDate?: number | null;
+}
+
+export async function updateModelRunSessionInfo(req: UpdateModelRunSessionRequest): Promise<void> {
+  return callService('TaskService', 'UpdateModelRunSessionInfo', req);
+}
+
+export interface AddModelRunRequest {
+  taskId: string;
+  modelName: string;
+  localPath?: string | null;
+}
+
+export async function addModelRun(req: AddModelRunRequest): Promise<void> {
+  return callService('TaskService', 'AddModelRun', req);
+}
+
+export async function deleteModelRun(taskId: string, modelName: string): Promise<void> {
+  return callService('TaskService', 'DeleteModelRun', taskId, modelName);
+}
+
+export interface BatchUpdateTasksRequest {
+  taskIds: string[];
+  field: 'status' | 'taskType';
+  value: string;
+}
+
+export interface BatchUpdateResult {
+  total: number;
+  succeeded: number;
+  failed: Array<{ taskId: string; error: string }>;
+}
+
+export async function batchUpdateTasks(req: BatchUpdateTasksRequest): Promise<BatchUpdateResult> {
+  return callService('TaskService', 'BatchUpdateTasks', req);
+}
+
+export async function batchDeleteTasks(taskIds: string[]): Promise<BatchUpdateResult> {
+  return callService('TaskService', 'BatchDeleteTasks', taskIds);
+}
+
+export interface UpdateTaskReportFieldsRequest {
+  id: string;
+  projectType: string;
+  changeScope: string;
+}
+
+export async function updateTaskReportFields(req: UpdateTaskReportFieldsRequest): Promise<void> {
+  return callService('TaskService', 'UpdateTaskReportFields', req);
+}

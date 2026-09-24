@@ -1,0 +1,12 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "规则化不满意原因，必须包含“过程不满意：”和“产物不满意：”两段；如果产物满意但过程不满意，产物段写“产物不满意：无”"
+    }
+  }
+}

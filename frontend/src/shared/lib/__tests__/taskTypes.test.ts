@@ -1,0 +1,149 @@
+import { describe, expect, it } from 'vitest';
+import {
+  buildTaskTypeChangeConfirmMessage,
+  buildProjectTaskTypes,
+  createNewProjectTaskSettings,
+  DEFAULT_TASK_TYPES,
+  deriveRemainingTaskTypeQuotas,
+  deriveTaskTypeUsedCounts,
+  getTaskTypeDisplayLabel,
+  getProjectTaskSettings,
+  getTaskTypeQuotaRawValue,
+  getTaskTypeQuotaValue,
+  normalizeTaskTypeName,
+  parseTaskTypeQuotas,
+  serializeProjectTaskSettings,
+  serializeTaskTypeQuotas,
+} from '../taskTypes';
+
+describe('taskTypes helpers', () => {
+  it('normalizes common aliases to canonical task types', () => {
+    expect(normalizeTaskTypeName('bugfix')).toBe('Bug修复');
+    expect(normalizeTaskTypeName('feature')).toBe('Feature迭代');
+    expect(normalizeTaskTypeName('代码生成')).toBe('0-1代码生成');
+    expect(normalizeTaskTypeName('从零到一')).toBe('0-1代码生成');
+    expect(normalizeTaskTypeName('0到1')).toBe('0-1代码生成');
+    expect(normalizeTaskTypeName('test')).toBe('代码测试');
+  });
+
+  it('exposes the code generation task type in defaults and display labels', () => {
+    expect(DEFAULT_TASK_TYPES).toContain('0-1代码生成');
+    expect(DEFAULT_TASK_TYPES).not.toContain('0-1');
+    expect(DEFAULT_TASK_TYPES).not.toContain('代码生成');
+    expect(getTaskTypeDisplayLabel('0-1代码生成')).toBe('0-1代码生成');
+  });
+
+  it('builds project task types with dedupe and fallback merge', () => {
+    expect(
+      buildProjectTaskTypes(
+        {
+          taskTypes: 'Bug修复\nfeature\n从零到一\n代码测试',
+          taskTypeQuotas: '{"Feature迭代":2,"Bug修复":1,"0-1":3}',
+        },
+        ['代码测试', '代码理解'],
+      ),
+    ).toEqual(['未归类', 'Bug修复', 'Feature迭代', '0-1代码生成', '代码测试', '代码理解']);
+  });
+
+  it('falls back to the default task type list when project config is empty', () => {
+    expect(buildProjectTaskTypes()).toEqual([...DEFAULT_TASK_TYPES]);
+  });
+
+  it('starts new project task settings without implicit totals or quotas', () => {
+    expect(createNewProjectTaskSettings()).toEqual({
+      taskTypes: [...DEFAULT_TASK_TYPES],
+      quotas: {},
+      totals: {},
+    });
+  });
+
+  it('mirrors totals and quotas through a single project task settings helper', () => {
+    expect(
+      getProjectTaskSettings({
+        taskTypes: 'Bug修复\n代码测试',
+        taskTypeTotals: '{"Bug修复":2,"Feature迭代":1}',
+      }),
+    ).toEqual({
+      taskTypes: ['未归类', 'Bug修复', '代码测试', 'Feature迭代'],
+      quotas: { Bug修复: 2, Feature迭代: 1 },
+      totals: { Bug修复: 2, Feature迭代: 1 },
+    });
+  });
+
+  it('builds a confirmation message for task type changes', () => {
+    expect(buildTaskTypeChangeConfirmMessage('Bug修复', 'Feature迭代')).toContain(
+      '本地文件夹名也会同步更改',
+    );
+    expect(buildTaskTypeChangeConfirmMessage('Bug修复', 'Feature迭代')).toContain(
+      'Bug 修复',
+    );
+    expect(buildTaskTypeChangeConfirmMessage('Bug修复', 'Feature迭代')).toContain(
+      'Feature 迭代',
+    );
+  });
+
+  it('serializes quotas only for allowed normalized task types', () => {
+    expect(
+      serializeTaskTypeQuotas(
+        {
+          bugfix: 2,
+          'Feature迭代': 3,
+          未知类型: 5,
+        },
+        ['Bug修复', 'Feature迭代'],
+      ),
+    ).toBe('{"Bug修复":2,"Feature迭代":3}');
+  });
+
+  it('serializes project task settings through one helper', () => {
+    expect(
+      serializeProjectTaskSettings(
+        ['Bug修复', 'Feature迭代'],
+        { bugfix: 2, Feature迭代: 3, 未知类型: 5 },
+        { Bug修复: 3, Feature迭代: 3 },
+      ),
+    ).toEqual({
+      taskTypes: '["未归类","Bug修复","Feature迭代"]',
+      taskTypeQuotas: '{"Bug修复":2,"Feature迭代":3}',
+      taskTypeTotals: '{"Bug修复":3,"Feature迭代":3}',
+    });
+  });
+
+  it('returns null for missing quotas and normalized values for matches', () => {
+    expect(getTaskTypeQuotaValue({ Bug修复: 2 }, 'bugfix')).toBe(2);
+    expect(getTaskTypeQuotaValue({ Bug修复: 2 }, '代码测试')).toBeNull();
+  });
+
+  it('preserves raw negative quotas while clamping display values', () => {
+    const quotas = parseTaskTypeQuotas('{"Bug修复":-1,"Feature迭代":2}');
+
+    expect(getTaskTypeQuotaRawValue(quotas, 'Bug修复')).toBe(-1);
+    expect(getTaskTypeQuotaValue(quotas, 'Bug修复')).toBe(0);
+    expect(getTaskTypeQuotaRawValue(quotas, 'Feature迭代')).toBe(2);
+  });
+
+  it('derives used counts and recomputed remaining quotas for project config editing', () => {
+    const usedCounts = deriveTaskTypeUsedCounts(
+      { Bug修复: 5, Feature迭代: 4 },
+      { Bug修复: 3, Feature迭代: -1 },
+      ['Bug修复', 'Feature迭代', '0-1代码生成'],
+    );
+
+    expect(usedCounts).toEqual({
+      Bug修复: 2,
+      Feature迭代: 5,
+    });
+
+    expect(
+      deriveRemainingTaskTypeQuotas(
+        ['Bug修复', 'Feature迭代', '0-1代码生成'],
+        { Bug修复: 6, Feature迭代: 8, '0-1代码生成': 2 },
+        usedCounts,
+      ),
+    ).toEqual({
+      Bug修复: 4,
+      Feature迭代: 3,
+      '0-1代码生成': 2,
+    });
+  });
+});

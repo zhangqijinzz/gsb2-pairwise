@@ -1,0 +1,1864 @@
+package task
+
+import (
+	"bufio"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/blueship581/pinru/internal/annotation"
+	"github.com/blueship581/pinru/internal/errs"
+	"github.com/blueship581/pinru/internal/store"
+	"github.com/blueship581/pinru/internal/util"
+	_ "modernc.org/sqlite"
+)
+
+var (
+	traeTraceIDPattern                = regexp.MustCompile(`trace_id(?:=|: )"?([a-f0-9]{32})"?`)
+	traeTimestampPattern              = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)`)
+	traeWorkspaceUserIDPattern        = regexp.MustCompile(`^(\d+)_`)
+	traeSessionLikePattern            = regexp.MustCompile(`(?:chat_session_id: |session_id=|chain_id=)([a-f0-9]{24})`)
+	traeCreateMessageIDPattern        = regexp.MustCompile(`message_id: ([a-f0-9]{24})`)
+	traeAssistantTaskMessageIDPattern = regexp.MustCompile(`task_id=[a-f0-9]{24}[^\n]*message_id=([a-f0-9]{24})`)
+	traeUserMessageIDFallbackPattern  = regexp.MustCompile(`user_message_id: ([a-f0-9]{24})`)
+	traeNoiseMessagePatterns          = []*regexp.Regexp{
+		regexp.MustCompile(`^帮我启动`),
+		regexp.MustCompile(`^启动(这个|当前)`),
+		regexp.MustCompile(`^帮我运行`),
+		regexp.MustCompile(`^运行(这个|当前)`),
+	}
+)
+
+var (
+	traeTodayLogDeepTailScanBytes int64 = 1024 * 1024 * 1024
+)
+
+type ExtractedTraeSession struct {
+	SessionID        string `json:"sessionId"`
+	UserConversation string `json:"userConversation"`
+	UserMessageCount int    `json:"userMessageCount"`
+	FirstUserMessage string `json:"firstUserMessage"`
+	LastActivityAt   *int64 `json:"lastActivityAt"`
+	IsCurrent        bool   `json:"isCurrent"`
+}
+
+type ExtractTaskSessionCandidate struct {
+	ID               string                 `json:"id"`
+	WorkspacePath    string                 `json:"workspacePath"`
+	MatchedPath      string                 `json:"matchedPath"`
+	MatchKind        string                 `json:"matchKind"`
+	SessionCount     int                    `json:"sessionCount"`
+	UserID           string                 `json:"userId"`
+	Username         string                 `json:"username"`
+	CurrentSessionID string                 `json:"currentSessionId"`
+	UserMessageCount int                    `json:"userMessageCount"`
+	Summary          string                 `json:"summary"`
+	LastActivityAt   *int64                 `json:"lastActivityAt"`
+	Sessions         []ExtractedTraeSession `json:"sessions"`
+}
+
+type ExtractTaskSessionsResult struct {
+	TaskID     string                        `json:"taskId"`
+	Source     string                        `json:"source,omitempty"`
+	Message    string                        `json:"message,omitempty"`
+	Candidates []ExtractTaskSessionCandidate `json:"candidates"`
+}
+
+type traeWorkspaceConversation struct {
+	RawSessionID string
+	IsCurrent    bool
+}
+
+type traeWorkspaceState struct {
+	UserID              string
+	Username            string
+	CurrentRawSessionID string
+	RawSessions         []traeWorkspaceConversation
+	InputHistory        []string
+}
+
+type traeMatchedWorkspace struct {
+	WorkspaceHash string
+	WorkspacePath string
+	MatchedPath   string
+	MatchKind     string
+	MatchScore    int
+	StateDBPath   string
+	State         traeWorkspaceState
+}
+
+type traeTraceRecord struct {
+	TraceID            string
+	RawSessionID       string
+	AssistantMessageID string
+	UserMessageID      string
+	Timestamp          time.Time
+	HasChatStart       bool
+}
+
+type traeMappedTurn struct {
+	Record           traeTraceRecord
+	UserConversation string
+}
+
+type traeCandidateBuild struct {
+	Candidate  ExtractTaskSessionCandidate
+	MatchScore int
+	IsCurrent  bool
+}
+
+type traeTraceRecordPartial struct {
+	HasChatStart       bool
+	Timestamp          time.Time
+	AssistantMessageID string
+	UserMessageID      string
+}
+
+type traeTraceScanResult struct {
+	TraceToRaw map[string]string
+	Records    map[string]traeTraceRecordPartial
+	Err        error
+}
+
+type traeWorkspaceJSON struct {
+	Folder    string            `json:"folder"`
+	Workspace string            `json:"workspace"`
+	Folders   []json.RawMessage `json:"folders"`
+}
+
+type traeWorkspaceMemento struct {
+	List []struct {
+		IsCurrent bool   `json:"isCurrent"`
+		SessionID string `json:"sessionId"`
+	} `json:"list"`
+	CurrentSessionID string `json:"currentSessionId"`
+}
+
+type traeInputHistoryItem struct {
+	InputText string `json:"inputText"`
+}
+
+func (s *TaskService) ExtractTaskSessions(taskID string) (*ExtractTaskSessionsResult, error) {
+	task, err := s.store.GetTask(taskID)
+	if err != nil {
+		return nil, err
+	}
+	if task == nil {
+		return nil, fmt.Errorf(errs.FmtCardNotFound, taskID)
+	}
+
+	annotationCase, err := s.store.GetAnnotationCase(taskID)
+	if err != nil {
+		return nil, err
+	}
+	if annotationCase != nil {
+		return buildClaudeAnnotationSessionResult(taskID, annotationCase), nil
+	}
+
+	modelRuns, err := s.store.ListModelRuns(taskID)
+	if err != nil {
+		return nil, err
+	}
+
+	targetPaths := collectTraeTargetPaths(task.LocalPath, modelRuns)
+	if len(targetPaths) == 0 {
+		return &ExtractTaskSessionsResult{
+			TaskID:     taskID,
+			Candidates: []ExtractTaskSessionCandidate{},
+		}, nil
+	}
+
+	// Read user-configured path overrides from config; fall back to platform defaults.
+	wsPathOverride, _ := s.store.GetConfig("trae_workspace_storage_path")
+	logsPathOverride, _ := s.store.GetConfig("trae_logs_path")
+
+	workspaces, err := discoverMatchedTraeWorkspaces(targetPaths, wsPathOverride)
+	if err != nil {
+		return nil, err
+	}
+	if len(workspaces) == 0 {
+		return &ExtractTaskSessionsResult{
+			TaskID:     taskID,
+			Candidates: []ExtractTaskSessionCandidate{},
+		}, nil
+	}
+
+	rawSessionIDs := make(map[string]struct{})
+	for _, workspace := range workspaces {
+		for _, rawSession := range workspace.State.RawSessions {
+			if rawSession.RawSessionID == "" {
+				continue
+			}
+			rawSessionIDs[rawSession.RawSessionID] = struct{}{}
+		}
+	}
+
+	traceRecordsByRaw, err := collectTraeTraceRecordsFromSystem(rawSessionIDs, logsPathOverride)
+	if err != nil {
+		return nil, err
+	}
+
+	candidates := buildTraeCandidates(workspaces, traceRecordsByRaw)
+	return &ExtractTaskSessionsResult{
+		TaskID:     taskID,
+		Candidates: candidates,
+	}, nil
+}
+
+func buildClaudeAnnotationSessionResult(taskID string, annotationCase *annotation.Case) *ExtractTaskSessionsResult {
+	result := &ExtractTaskSessionsResult{
+		TaskID:     taskID,
+		Source:     "claude_code",
+		Candidates: []ExtractTaskSessionCandidate{},
+	}
+	if annotationCase == nil {
+		return result
+	}
+
+	candidate := buildClaudeAnnotationCandidate(annotationCase)
+	if candidate == nil {
+		if strings.TrimSpace(annotationCase.ContainerID) == "" {
+			result.Message = "该题已创建容器标注快照，但还没有绑定 Claude Code 容器。请先到“容器标注”页面绑定容器。"
+		} else {
+			result.Message = "该题已绑定 Claude Code 容器，但还没有采集可用轨迹。请先到“容器标注”页面选择 JSONL 并采集轨迹。"
+		}
+		return result
+	}
+	result.Candidates = []ExtractTaskSessionCandidate{*candidate}
+	return result
+}
+
+func buildClaudeAnnotationCandidate(annotationCase *annotation.Case) *ExtractTaskSessionCandidate {
+	if annotationCase == nil {
+		return nil
+	}
+	rounds := make([]annotation.Round, 0, len(annotationCase.Rounds))
+	for _, round := range annotationCase.Rounds {
+		if strings.TrimSpace(round.Status) != "complete" {
+			continue
+		}
+		if strings.TrimSpace(round.SessionID) == "" || strings.TrimSpace(round.PromptID) == "" {
+			continue
+		}
+		if strings.TrimSpace(round.Prompt) == "" {
+			continue
+		}
+		rounds = append(rounds, round)
+	}
+	if len(rounds) == 0 {
+		return nil
+	}
+	sort.SliceStable(rounds, func(i, j int) bool {
+		if rounds[i].Order != rounds[j].Order {
+			return rounds[i].Order < rounds[j].Order
+		}
+		return rounds[i].PromptID < rounds[j].PromptID
+	})
+
+	sourcePath := strings.TrimSpace(annotationCase.SourcePath)
+	if sourcePath == "" {
+		sourcePath = strings.TrimSpace(annotationCase.WorkspacePath)
+	}
+	sessions := make([]ExtractedTraeSession, 0, len(rounds))
+	for index, round := range rounds {
+		sessionID := strings.TrimSpace(round.SessionID) + "#" + strings.TrimSpace(round.PromptID)
+		sessions = append(sessions, ExtractedTraeSession{
+			SessionID:        sessionID,
+			UserConversation: strings.TrimSpace(round.Prompt),
+			UserMessageCount: 1,
+			FirstUserMessage: strings.TrimSpace(round.Prompt),
+			IsCurrent:        index == len(rounds)-1,
+		})
+	}
+	lastActivityAt := annotationCase.UpdatedAt
+	return &ExtractTaskSessionCandidate{
+		ID:               "claude-code:" + strings.TrimSpace(annotationCase.TaskID),
+		WorkspacePath:    sourcePath,
+		MatchedPath:      sourcePath,
+		MatchKind:        "claude_code",
+		SessionCount:     len(sessions),
+		UserID:           strings.TrimSpace(annotationCase.ContainerID),
+		Username:         strings.TrimSpace(annotationCase.ContainerName),
+		CurrentSessionID: strings.TrimSpace(annotationCase.SessionID),
+		UserMessageCount: len(sessions),
+		Summary:          "Claude Code 容器轨迹",
+		LastActivityAt:   &lastActivityAt,
+		Sessions:         sessions,
+	}
+}
+
+func collectTraeTargetPaths(taskLocalPath *string, modelRuns []store.ModelRun) []string {
+	seen := make(map[string]struct{})
+	targetPaths := make([]string, 0, len(modelRuns)+1)
+
+	appendUnique := func(rawPath *string) {
+		if rawPath == nil {
+			return
+		}
+		normalized := normalizeTraePath(*rawPath)
+		if normalized == "" {
+			return
+		}
+		if _, exists := seen[normalized]; exists {
+			return
+		}
+		seen[normalized] = struct{}{}
+		targetPaths = append(targetPaths, normalized)
+	}
+
+	appendUnique(taskLocalPath)
+	for _, modelRun := range modelRuns {
+		appendUnique(modelRun.LocalPath)
+	}
+
+	return targetPaths
+}
+
+func normalizeTraePath(rawPath string) string {
+	trimmed := strings.TrimSpace(rawPath)
+	if trimmed == "" {
+		return ""
+	}
+	expanded := util.ExpandTilde(trimmed)
+	if !filepath.IsAbs(expanded) {
+		if absPath, err := filepath.Abs(expanded); err == nil {
+			expanded = absPath
+		}
+	}
+	return filepath.Clean(expanded)
+}
+
+func discoverMatchedTraeWorkspaces(targetPaths []string, wsPathOverride string) ([]traeMatchedWorkspace, error) {
+	workspaceBase, err := traeWorkspaceStorageBase(wsPathOverride)
+	if err != nil {
+		return nil, err
+	}
+
+	entries, err := os.ReadDir(workspaceBase)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	results := make([]*traeMatchedWorkspace, len(entries))
+	workerCount := parallelTraeWorkspaceWorkerCount(len(entries))
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+
+	for worker := 0; worker < workerCount; worker += 1 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				entry := entries[index]
+				if !entry.IsDir() {
+					continue
+				}
+
+				workspaceDir := filepath.Join(workspaceBase, entry.Name())
+				workspaceJSONPath := filepath.Join(workspaceDir, "workspace.json")
+				stateDBPath := filepath.Join(workspaceDir, "state.vscdb")
+
+				if !fileExists(workspaceJSONPath) || !fileExists(stateDBPath) {
+					continue
+				}
+
+				workspacePath, readErr := readTraeWorkspaceFolder(workspaceJSONPath)
+				if readErr != nil || workspacePath == "" {
+					continue
+				}
+
+				matchedPath, matchKind, matchScore, ok := bestTraeWorkspacePathMatch(workspacePath, targetPaths)
+				if !ok {
+					continue
+				}
+
+				state, stateErr := loadTraeWorkspaceState(stateDBPath)
+				if stateErr != nil || len(state.RawSessions) == 0 {
+					continue
+				}
+
+				results[index] = &traeMatchedWorkspace{
+					WorkspaceHash: entry.Name(),
+					WorkspacePath: workspacePath,
+					MatchedPath:   matchedPath,
+					MatchKind:     matchKind,
+					MatchScore:    matchScore,
+					StateDBPath:   stateDBPath,
+					State:         state,
+				}
+			}
+		}()
+	}
+
+	for index := range entries {
+		jobs <- index
+	}
+	close(jobs)
+	wg.Wait()
+
+	matches := make([]traeMatchedWorkspace, 0)
+	for _, result := range results {
+		if result == nil {
+			continue
+		}
+		matches = append(matches, *result)
+	}
+
+	sort.SliceStable(matches, func(i, j int) bool {
+		if matches[i].MatchScore != matches[j].MatchScore {
+			return matches[i].MatchScore > matches[j].MatchScore
+		}
+		if matches[i].MatchedPath != matches[j].MatchedPath {
+			return matches[i].MatchedPath < matches[j].MatchedPath
+		}
+		return matches[i].WorkspacePath < matches[j].WorkspacePath
+	})
+
+	return matches, nil
+}
+
+func traeWorkspaceStorageBase(override string) (string, error) {
+	if trimmed := strings.TrimSpace(override); trimmed != "" {
+		return util.NormalizePath(trimmed), nil
+	}
+	p := util.DefaultTraeWorkspaceStoragePath()
+	if p == "" {
+		return "", fmt.Errorf(errs.FmtUserDirShort)
+	}
+	return p, nil
+}
+
+func traeLogsBase(override string) (string, error) {
+	if trimmed := strings.TrimSpace(override); trimmed != "" {
+		return util.NormalizePath(trimmed), nil
+	}
+	p := util.DefaultTraeLogsPath()
+	if p == "" {
+		return "", fmt.Errorf(errs.FmtUserDirShort)
+	}
+	return p, nil
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+func readTraeWorkspaceFolder(workspaceJSONPath string) (string, error) {
+	return readTraeWorkspaceFolderWithSeen(workspaceJSONPath, map[string]struct{}{})
+}
+
+func readTraeWorkspaceFolderWithSeen(workspaceJSONPath string, seen map[string]struct{}) (string, error) {
+	normalizedJSONPath := normalizeTraePath(workspaceJSONPath)
+	if normalizedJSONPath == "" {
+		return "", nil
+	}
+	if _, exists := seen[normalizedJSONPath]; exists {
+		return "", fmt.Errorf(errs.FmtDetectedCyclicTrae, normalizedJSONPath)
+	}
+	seen[normalizedJSONPath] = struct{}{}
+
+	content, err := os.ReadFile(normalizedJSONPath)
+	if err != nil {
+		return "", err
+	}
+
+	var payload traeWorkspaceJSON
+	if err := json.Unmarshal(content, &payload); err != nil {
+		return "", err
+	}
+	baseDir := filepath.Dir(normalizedJSONPath)
+
+	if folder := resolveTraeWorkspaceLocation(payload.Folder, baseDir); folder != "" {
+		return folder, nil
+	}
+
+	if folder := resolveTraeWorkspaceFolders(payload.Folders, baseDir); folder != "" {
+		return folder, nil
+	}
+
+	if workspaceRef := resolveTraeWorkspaceLocation(payload.Workspace, baseDir); workspaceRef != "" {
+		if !fileExists(workspaceRef) {
+			return "", nil
+		}
+		return readTraeWorkspaceFolderWithSeen(workspaceRef, seen)
+	}
+
+	return "", nil
+}
+
+func resolveTraeWorkspaceFolders(entries []json.RawMessage, baseDir string) string {
+	for _, rawEntry := range entries {
+		var asString string
+		if err := json.Unmarshal(rawEntry, &asString); err == nil {
+			if resolved := resolveTraeWorkspaceLocation(asString, baseDir); resolved != "" {
+				return resolved
+			}
+			continue
+		}
+
+		var asObject struct {
+			Path string `json:"path"`
+			URI  string `json:"uri"`
+		}
+		if err := json.Unmarshal(rawEntry, &asObject); err != nil {
+			continue
+		}
+		if resolved := resolveTraeWorkspaceLocation(asObject.Path, baseDir); resolved != "" {
+			return resolved
+		}
+		if resolved := resolveTraeWorkspaceLocation(asObject.URI, baseDir); resolved != "" {
+			return resolved
+		}
+	}
+	return ""
+}
+
+func resolveTraeWorkspaceLocation(rawValue string, baseDir string) string {
+	decoded := strings.TrimSpace(rawValue)
+	if decoded == "" {
+		return ""
+	}
+
+	if parsed, err := url.Parse(decoded); err == nil && parsed.Scheme == "file" {
+		pathValue, pathErr := url.PathUnescape(parsed.Path)
+		if pathErr == nil && pathValue != "" {
+			return normalizeTraePath(pathValue)
+		}
+	}
+
+	if strings.HasPrefix(decoded, "file://") {
+		pathValue, pathErr := url.PathUnescape(strings.TrimPrefix(decoded, "file://"))
+		if pathErr == nil && pathValue != "" {
+			return normalizeTraePath(pathValue)
+		}
+	}
+
+	expanded := util.ExpandTilde(decoded)
+	if !filepath.IsAbs(expanded) && strings.TrimSpace(baseDir) != "" {
+		expanded = filepath.Join(baseDir, expanded)
+	}
+	return normalizeTraePath(expanded)
+}
+
+func bestTraeWorkspacePathMatch(workspacePath string, targetPaths []string) (string, string, int, bool) {
+	normalizedWorkspace := normalizeTraePath(workspacePath)
+	if normalizedWorkspace == "" {
+		return "", "", 0, false
+	}
+
+	bestMatchedPath := ""
+	bestKind := ""
+	bestScore := 0
+	bestDistance := 1 << 30
+
+	for _, targetPath := range targetPaths {
+		normalizedTarget := normalizeTraePath(targetPath)
+		if normalizedTarget == "" {
+			continue
+		}
+
+		switch {
+		case util.SamePath(normalizedWorkspace, normalizedTarget):
+			distance := 0
+			if bestScore < 300 || (bestScore == 300 && distance < bestDistance) {
+				bestMatchedPath = normalizedTarget
+				bestKind = "exact"
+				bestScore = 300
+				bestDistance = distance
+			}
+		case isSameOrChildPath(normalizedWorkspace, normalizedTarget):
+			distance := pathDepth(normalizedWorkspace) - pathDepth(normalizedTarget)
+			if bestScore < 200 || (bestScore == 200 && distance < bestDistance) {
+				bestMatchedPath = normalizedTarget
+				bestKind = "child"
+				bestScore = 200
+				bestDistance = distance
+			}
+		case isSiblingModelPath(normalizedWorkspace, normalizedTarget):
+			distance := absInt(pathDepth(normalizedWorkspace) - pathDepth(normalizedTarget))
+			if bestScore < 180 || (bestScore == 180 && distance < bestDistance) {
+				bestMatchedPath = normalizedTarget
+				bestKind = "sibling"
+				bestScore = 180
+				bestDistance = distance
+			}
+		case isPeerModelPath(normalizedWorkspace, normalizedTarget):
+			distance := absInt(pathDepth(normalizedWorkspace) - pathDepth(normalizedTarget))
+			if bestScore < 170 || (bestScore == 170 && distance < bestDistance) {
+				bestMatchedPath = normalizedTarget
+				bestKind = "peer_model"
+				bestScore = 170
+				bestDistance = distance
+			}
+		case isSiblingTaskPath(normalizedWorkspace, normalizedTarget):
+			distance := absInt(pathDepth(normalizedWorkspace) - pathDepth(normalizedTarget))
+			if bestScore < 160 || (bestScore == 160 && distance < bestDistance) {
+				bestMatchedPath = normalizedTarget
+				bestKind = "sibling"
+				bestScore = 160
+				bestDistance = distance
+			}
+		case isPeerTaskPath(normalizedWorkspace, normalizedTarget):
+			distance := absInt(pathDepth(normalizedWorkspace) - pathDepth(normalizedTarget))
+			if bestScore < 150 || (bestScore == 150 && distance < bestDistance) {
+				bestMatchedPath = normalizedTarget
+				bestKind = "peer_task"
+				bestScore = 150
+				bestDistance = distance
+			}
+		case isSameOrChildPath(normalizedTarget, normalizedWorkspace):
+			distance := pathDepth(normalizedTarget) - pathDepth(normalizedWorkspace)
+			if bestScore < 100 || (bestScore == 100 && distance < bestDistance) {
+				bestMatchedPath = normalizedTarget
+				bestKind = "parent"
+				bestScore = 100
+				bestDistance = distance
+			}
+		}
+	}
+
+	return bestMatchedPath, bestKind, bestScore, bestMatchedPath != ""
+}
+
+func isSameOrChildPath(pathValue, maybeParent string) bool {
+	normalizedPath := normalizeTraePath(pathValue)
+	normalizedParent := normalizeTraePath(maybeParent)
+	if normalizedPath == "" || normalizedParent == "" {
+		return false
+	}
+	if util.SamePath(normalizedPath, normalizedParent) {
+		return true
+	}
+
+	parentPrefix := normalizedParent
+	if !strings.HasSuffix(parentPrefix, string(os.PathSeparator)) {
+		parentPrefix += string(os.PathSeparator)
+	}
+	return strings.HasPrefix(normalizedPath, parentPrefix)
+}
+
+func pathDepth(pathValue string) int {
+	normalized := normalizeTraePath(pathValue)
+	if normalized == "" {
+		return 0
+	}
+	count := 0
+	for _, part := range strings.Split(normalized, string(os.PathSeparator)) {
+		if part != "" {
+			count++
+		}
+	}
+	return count
+}
+
+var traeTaskLabelTokenPattern = regexp.MustCompile(`(?i)^label-\d+`)
+
+func isSiblingTaskPath(leftPath, rightPath string) bool {
+	leftToken := extractTraeTaskLabelToken(leftPath)
+	rightToken := extractTraeTaskLabelToken(rightPath)
+	if leftToken == "" || leftToken != rightToken {
+		return false
+	}
+
+	leftParent := normalizeTraePath(filepath.Dir(leftPath))
+	rightParent := normalizeTraePath(filepath.Dir(rightPath))
+	if leftParent == "" || rightParent == "" {
+		return false
+	}
+
+	return util.SamePath(leftParent, rightParent)
+}
+
+func isSiblingModelPath(leftPath, rightPath string) bool {
+	if !strings.EqualFold(filepath.Base(leftPath), filepath.Base(rightPath)) {
+		return false
+	}
+
+	leftToken := extractTraeTaskLabelToken(leftPath)
+	rightToken := extractTraeTaskLabelToken(rightPath)
+	if leftToken == "" || leftToken != rightToken {
+		return false
+	}
+
+	leftGrandparent := normalizeTraePath(filepath.Dir(filepath.Dir(leftPath)))
+	rightGrandparent := normalizeTraePath(filepath.Dir(filepath.Dir(rightPath)))
+	if leftGrandparent == "" || rightGrandparent == "" {
+		return false
+	}
+
+	return util.SamePath(leftGrandparent, rightGrandparent)
+}
+
+func isPeerModelPath(leftPath, rightPath string) bool {
+	if !strings.EqualFold(filepath.Base(leftPath), filepath.Base(rightPath)) {
+		return false
+	}
+
+	leftToken := extractTraeTaskLabelToken(leftPath)
+	rightToken := extractTraeTaskLabelToken(rightPath)
+	return leftToken != "" && leftToken == rightToken
+}
+
+func isPeerTaskPath(leftPath, rightPath string) bool {
+	leftToken := extractTraeTaskLabelToken(leftPath)
+	rightToken := extractTraeTaskLabelToken(rightPath)
+	if leftToken == "" || leftToken != rightToken {
+		return false
+	}
+
+	return pathBaseStartsWithTaskLabel(leftPath, leftToken) || pathBaseStartsWithTaskLabel(rightPath, rightToken)
+}
+
+func pathBaseStartsWithTaskLabel(pathValue, taskLabel string) bool {
+	if taskLabel == "" {
+		return false
+	}
+	return strings.HasPrefix(strings.ToLower(filepath.Base(pathValue)), strings.ToLower(taskLabel))
+}
+
+func extractTraeTaskLabelToken(pathValue string) string {
+	normalized := normalizeTraePath(pathValue)
+	if normalized == "" {
+		return ""
+	}
+
+	for _, part := range strings.Split(normalized, string(os.PathSeparator)) {
+		if match := traeTaskLabelTokenPattern.FindString(part); match != "" {
+			return strings.ToLower(match)
+		}
+	}
+	return ""
+}
+
+func absInt(value int) int {
+	if value < 0 {
+		return -value
+	}
+	return value
+}
+
+func loadTraeWorkspaceState(stateDBPath string) (traeWorkspaceState, error) {
+	state := traeWorkspaceState{}
+
+	db, err := sql.Open("sqlite", stateDBPath)
+	if err != nil {
+		return state, err
+	}
+	defer db.Close()
+
+	db.SetMaxOpenConns(1)
+
+	rawMemento, err := queryOptionalSQLiteString(db, "SELECT value FROM ItemTable WHERE key='memento/icube-ai-agent-storage'")
+	if err != nil {
+		return state, err
+	}
+	if strings.TrimSpace(rawMemento) != "" {
+		var memento traeWorkspaceMemento
+		if err := json.Unmarshal([]byte(rawMemento), &memento); err == nil {
+			state.CurrentRawSessionID = strings.TrimSpace(memento.CurrentSessionID)
+			seen := make(map[string]struct{})
+			for _, item := range memento.List {
+				rawSessionID := strings.TrimSpace(item.SessionID)
+				if rawSessionID == "" {
+					continue
+				}
+				if _, exists := seen[rawSessionID]; exists {
+					continue
+				}
+				seen[rawSessionID] = struct{}{}
+				state.RawSessions = append(state.RawSessions, traeWorkspaceConversation{
+					RawSessionID: rawSessionID,
+					IsCurrent:    item.IsCurrent || rawSessionID == state.CurrentRawSessionID,
+				})
+			}
+			if state.CurrentRawSessionID != "" {
+				if _, exists := seen[state.CurrentRawSessionID]; !exists {
+					state.RawSessions = append(state.RawSessions, traeWorkspaceConversation{
+						RawSessionID: state.CurrentRawSessionID,
+						IsCurrent:    true,
+					})
+				}
+			}
+		}
+	}
+
+	userID, err := inferTraeWorkspaceUserID(db, state.RawSessions, state.CurrentRawSessionID)
+	if err != nil {
+		return state, err
+	}
+	state.UserID = userID
+	if state.UserID != "" {
+		username, usernameErr := inferTraeWorkspaceUsername(db, state.UserID)
+		if usernameErr != nil {
+			return state, usernameErr
+		}
+		state.Username = username
+	}
+
+	rawInputHistory, err := queryOptionalSQLiteString(db, "SELECT value FROM ItemTable WHERE key='icube-ai-agent-storage-input-history'")
+	if err != nil {
+		return state, err
+	}
+	if strings.TrimSpace(rawInputHistory) != "" {
+		var history []traeInputHistoryItem
+		if err := json.Unmarshal([]byte(rawInputHistory), &history); err == nil {
+			for _, item := range history {
+				state.InputHistory = append(state.InputHistory, strings.TrimSpace(item.InputText))
+			}
+		}
+	}
+
+	return state, nil
+}
+
+func inferTraeWorkspaceUserID(
+	db *sql.DB,
+	rawSessions []traeWorkspaceConversation,
+	currentRawSessionID string,
+) (string, error) {
+	userIDs, err := listTraeWorkspaceUserIDs(db)
+	if err != nil {
+		return "", err
+	}
+	if len(userIDs) == 0 {
+		return "", nil
+	}
+	if len(userIDs) == 1 {
+		return userIDs[0], nil
+	}
+
+	rawSessionIDs := uniqueTraeRawSessionIDs(rawSessions, currentRawSessionID)
+	if len(rawSessionIDs) > 0 {
+		bestUserID, bestScore, scoreErr := resolveTraeWorkspaceUserBySessionOwnership(
+			db,
+			userIDs,
+			rawSessionIDs,
+			strings.TrimSpace(currentRawSessionID),
+		)
+		if scoreErr != nil {
+			return "", scoreErr
+		}
+		if bestScore > 0 {
+			return bestUserID, nil
+		}
+	}
+
+	userKey, err := queryOptionalSQLiteString(db, "SELECT key FROM ItemTable WHERE key LIKE '%_ai-chat:%' LIMIT 1")
+	if err != nil {
+		return "", err
+	}
+	if matches := traeWorkspaceUserIDPattern.FindStringSubmatch(userKey); len(matches) == 2 {
+		return matches[1], nil
+	}
+
+	return userIDs[0], nil
+}
+
+func listTraeWorkspaceUserIDs(db *sql.DB) ([]string, error) {
+	rows, err := db.Query(
+		"SELECT key FROM ItemTable WHERE key LIKE '%_ai-chat:%' OR key LIKE '%_AI.agent.%'",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	seen := make(map[string]struct{})
+	userIDs := make([]string, 0)
+	for rows.Next() {
+		var key sql.NullString
+		if scanErr := rows.Scan(&key); scanErr != nil {
+			return nil, scanErr
+		}
+		if !key.Valid {
+			continue
+		}
+		userID := extractTraeUserIDFromKey(key.String)
+		if userID == "" {
+			continue
+		}
+		if _, exists := seen[userID]; exists {
+			continue
+		}
+		seen[userID] = struct{}{}
+		userIDs = append(userIDs, userID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	sort.Strings(userIDs)
+	return userIDs, nil
+}
+
+func uniqueTraeRawSessionIDs(rawSessions []traeWorkspaceConversation, currentRawSessionID string) []string {
+	seen := make(map[string]struct{})
+	result := make([]string, 0, len(rawSessions)+1)
+
+	appendUnique := func(rawSessionID string) {
+		trimmed := strings.TrimSpace(rawSessionID)
+		if trimmed == "" {
+			return
+		}
+		if _, exists := seen[trimmed]; exists {
+			return
+		}
+		seen[trimmed] = struct{}{}
+		result = append(result, trimmed)
+	}
+
+	appendUnique(currentRawSessionID)
+	for _, rawSession := range rawSessions {
+		appendUnique(rawSession.RawSessionID)
+	}
+
+	return result
+}
+
+func resolveTraeWorkspaceUserBySessionOwnership(
+	db *sql.DB,
+	userIDs []string,
+	rawSessionIDs []string,
+	currentRawSessionID string,
+) (string, int, error) {
+	if len(userIDs) == 0 || len(rawSessionIDs) == 0 {
+		return "", 0, nil
+	}
+
+	allowedUserIDs := make(map[string]struct{}, len(userIDs))
+	for _, userID := range userIDs {
+		allowedUserIDs[strings.TrimSpace(userID)] = struct{}{}
+	}
+
+	rows, err := db.Query(
+		"SELECT key, value FROM ItemTable WHERE key LIKE '%_ai-chat:%' OR key LIKE '%_AI.agent.%'",
+	)
+	if err != nil {
+		return "", 0, err
+	}
+	defer rows.Close()
+
+	scores := make(map[string]int, len(userIDs))
+	for rows.Next() {
+		var (
+			key   sql.NullString
+			value sql.NullString
+		)
+		if scanErr := rows.Scan(&key, &value); scanErr != nil {
+			return "", 0, scanErr
+		}
+		if !key.Valid {
+			continue
+		}
+
+		userID := extractTraeUserIDFromKey(key.String)
+		if userID == "" {
+			continue
+		}
+		if _, allowed := allowedUserIDs[userID]; !allowed {
+			continue
+		}
+
+		weight := traeSessionOwnershipKeyWeight(key.String)
+		if weight <= 0 || !value.Valid {
+			continue
+		}
+
+		score := 0
+		for _, rawSessionID := range rawSessionIDs {
+			if !strings.Contains(value.String, `"`+rawSessionID+`"`) {
+				continue
+			}
+			score += weight
+			if rawSessionID == currentRawSessionID {
+				score += 6
+			}
+		}
+		if score > 0 {
+			scores[userID] += score
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", 0, err
+	}
+
+	bestUserID := ""
+	bestScore := 0
+	for _, userID := range userIDs {
+		score := scores[userID]
+		if score > bestScore || (score == bestScore && score > 0 && userID < bestUserID) {
+			bestUserID = userID
+			bestScore = score
+		}
+	}
+	return bestUserID, bestScore, nil
+}
+
+func extractTraeUserIDFromKey(key string) string {
+	if matches := traeWorkspaceUserIDPattern.FindStringSubmatch(strings.TrimSpace(key)); len(matches) == 2 {
+		return matches[1]
+	}
+	return ""
+}
+
+func traeSessionOwnershipKeyWeight(key string) int {
+	lowerKey := strings.ToLower(strings.TrimSpace(key))
+	switch {
+	case strings.Contains(lowerKey, "_ai-chat:sessionrelation:modelmap"),
+		strings.Contains(lowerKey, "_ai-chat:sessionrelation:modemap"):
+		return 10
+	case strings.Contains(lowerKey, "_ai-chat:sessionrelation:planmodemap"),
+		strings.Contains(lowerKey, "_ai-chat:sessionrelation:specmodemap"):
+		return 8
+	case strings.Contains(lowerKey, "_ai.agent.plan.mode.map"),
+		strings.Contains(lowerKey, "_ai.agent.spec.mode.map"):
+		return 4
+	default:
+		return 0
+	}
+}
+
+func inferTraeWorkspaceUsername(db *sql.DB, userID string) (string, error) {
+	trimmedUserID := strings.TrimSpace(userID)
+	if trimmedUserID == "" {
+		return "", nil
+	}
+
+	rows, err := db.Query("SELECT key, value FROM ItemTable WHERE key LIKE ?", trimmedUserID+"_%")
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	bestValue := ""
+	bestScore := 0
+	for rows.Next() {
+		var (
+			key   string
+			value sql.NullString
+		)
+		if scanErr := rows.Scan(&key, &value); scanErr != nil {
+			return "", scanErr
+		}
+		if !value.Valid {
+			continue
+		}
+
+		candidateValue, candidateScore := inferTraeWorkspaceUsernameFromValue(key, value.String, trimmedUserID)
+		if candidateScore > bestScore {
+			bestValue = candidateValue
+			bestScore = candidateScore
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	return bestValue, nil
+}
+
+func inferTraeWorkspaceUsernameFromValue(key, rawValue, userID string) (string, int) {
+	bestValue, bestScore := scoreTraeUsernameCandidate(rawValue, key, userID, 0)
+	trimmed := strings.TrimSpace(rawValue)
+	if trimmed == "" {
+		return bestValue, bestScore
+	}
+
+	var payload any
+	if err := json.Unmarshal([]byte(trimmed), &payload); err != nil {
+		return bestValue, bestScore
+	}
+
+	jsonValue, jsonScore := scanTraeUsernamePayload(payload, key, userID, 0)
+	if jsonScore > bestScore {
+		return jsonValue, jsonScore
+	}
+	return bestValue, bestScore
+}
+
+func scanTraeUsernamePayload(payload any, keyPath, userID string, inheritedScore int) (string, int) {
+	bestValue := ""
+	bestScore := 0
+
+	switch typed := payload.(type) {
+	case map[string]any:
+		for rawKey, value := range typed {
+			nextKeyPath := rawKey
+			if keyPath != "" {
+				nextKeyPath = keyPath + "." + rawKey
+			}
+			keyScore := inheritedScore + traeUsernameKeyScore(rawKey)
+			if candidateValue, candidateScore := scoreTraeUsernameCandidate(fmt.Sprint(value), nextKeyPath, userID, keyScore); candidateScore > bestScore {
+				bestValue = candidateValue
+				bestScore = candidateScore
+			}
+			if nestedValue, nestedScore := scanTraeUsernamePayload(value, nextKeyPath, userID, keyScore); nestedScore > bestScore {
+				bestValue = nestedValue
+				bestScore = nestedScore
+			}
+		}
+	case []any:
+		for _, item := range typed {
+			if nestedValue, nestedScore := scanTraeUsernamePayload(item, keyPath, userID, inheritedScore); nestedScore > bestScore {
+				bestValue = nestedValue
+				bestScore = nestedScore
+			}
+		}
+	}
+
+	return bestValue, bestScore
+}
+
+func traeUsernameKeyScore(key string) int {
+	lowerKey := strings.ToLower(strings.TrimSpace(key))
+	switch {
+	case strings.Contains(lowerKey, "displayname"), strings.Contains(lowerKey, "display_name"):
+		return 40
+	case strings.Contains(lowerKey, "nickname"), strings.Contains(lowerKey, "nick_name"):
+		return 38
+	case strings.Contains(lowerKey, "username"), strings.Contains(lowerKey, "user_name"):
+		return 36
+	case lowerKey == "name", strings.HasSuffix(lowerKey, ".name"):
+		return 18
+	default:
+		return 0
+	}
+}
+
+func scoreTraeUsernameCandidate(rawValue, keyPath, userID string, baseScore int) (string, int) {
+	trimmed := strings.TrimSpace(rawValue)
+	if trimmed == "" {
+		return "", 0
+	}
+
+	trimmed = strings.Trim(trimmed, `"`)
+	if trimmed == "" || trimmed == userID {
+		return "", 0
+	}
+	if len(trimmed) > 96 {
+		return "", 0
+	}
+
+	lowerValue := strings.ToLower(trimmed)
+	if strings.ContainsAny(trimmed, "{}[]") || strings.HasPrefix(lowerValue, "http://") || strings.HasPrefix(lowerValue, "https://") {
+		return "", 0
+	}
+	if !strings.ContainsAny(trimmed, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.@ ") {
+		return "", 0
+	}
+
+	score := baseScore + traeUsernameKeyScore(keyPath)
+	if strings.Contains(trimmed, "@") {
+		score += 6
+	}
+	if len(strings.Fields(trimmed)) > 1 {
+		score += 4
+	}
+	if score <= 0 {
+		return "", 0
+	}
+
+	return trimmed, score
+}
+
+func queryOptionalSQLiteString(db *sql.DB, query string, args ...any) (string, error) {
+	var value sql.NullString
+	err := db.QueryRow(query, args...).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if !value.Valid {
+		return "", nil
+	}
+	return value.String, nil
+}
+
+func collectTraeTraceRecordsFromSystem(rawSessionIDs map[string]struct{}, logsPathOverride string) (map[string][]traeTraceRecord, error) {
+	logFiles, err := traeLogFiles(logsPathOverride)
+	if err != nil {
+		return nil, err
+	}
+	if len(logFiles) == 0 {
+		return map[string][]traeTraceRecord{}, nil
+	}
+
+	todayLogFiles, historyLogFiles := partitionTraeLogFilesByDay(logFiles, time.Now())
+	if len(todayLogFiles) > 0 {
+		recordsByRaw, collectErr := collectTraeTraceRecordsWithTailLimit(todayLogFiles, rawSessionIDs, traeTodayLogDeepTailScanBytes)
+		if collectErr != nil {
+			return nil, collectErr
+		}
+		if len(recordsByRaw) > 0 || len(historyLogFiles) == 0 {
+			return recordsByRaw, nil
+		}
+	}
+
+	if len(historyLogFiles) == 0 {
+		return map[string][]traeTraceRecord{}, nil
+	}
+	return collectTraeTraceRecords(historyLogFiles, rawSessionIDs)
+}
+
+func traeLogFiles(override string) ([]string, error) {
+	logsBase, err := traeLogsBase(override)
+	if err != nil {
+		return nil, err
+	}
+	pattern := filepath.Join(logsBase, "*/Modular/ai-agent_*_stdout.log")
+	files, err := filepath.Glob(pattern)
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
+func partitionTraeLogFilesByDay(logFiles []string, now time.Time) ([]string, []string) {
+	if len(logFiles) == 0 {
+		return nil, nil
+	}
+
+	current := now.In(time.Local)
+	today := make([]string, 0, len(logFiles))
+	history := make([]string, 0, len(logFiles))
+
+	for _, logFile := range logFiles {
+		info, err := os.Stat(logFile)
+		if err != nil {
+			history = append(history, logFile)
+			continue
+		}
+
+		modifiedAt := info.ModTime().In(current.Location())
+		if modifiedAt.Year() == current.Year() &&
+			modifiedAt.Month() == current.Month() &&
+			modifiedAt.Day() == current.Day() {
+			today = append(today, logFile)
+			continue
+		}
+		history = append(history, logFile)
+	}
+
+	return today, history
+}
+
+func collectTraeTraceRecords(logFiles []string, rawSessionIDs map[string]struct{}) (map[string][]traeTraceRecord, error) {
+	return collectTraeTraceRecordsWithTailLimit(logFiles, rawSessionIDs, 0)
+}
+
+func collectTraeTraceRecordsWithTailLimit(logFiles []string, rawSessionIDs map[string]struct{}, tailLimitBytes int64) (map[string][]traeTraceRecord, error) {
+	if len(rawSessionIDs) == 0 {
+		return map[string][]traeTraceRecord{}, nil
+	}
+
+	results, err := runTraeLogWorkers(logFiles, func(index int, logFile string) traeTraceScanResult {
+		return scanTraeLogFileForRecords(index, logFile, rawSessionIDs, tailLimitBytes)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	traceToRawSession := make(map[string]string)
+	recordsByTrace := make(map[string]*traeTraceRecord)
+	for _, result := range results {
+		if result.Err != nil {
+			return nil, result.Err
+		}
+		for traceID, rawSessionID := range result.TraceToRaw {
+			if _, exists := traceToRawSession[traceID]; !exists {
+				traceToRawSession[traceID] = rawSessionID
+			}
+		}
+		for traceID, partial := range result.Records {
+			record, exists := recordsByTrace[traceID]
+			if !exists {
+				record = &traeTraceRecord{TraceID: traceID}
+				recordsByTrace[traceID] = record
+			}
+			mergeTraeTraceRecordPartial(record, partial)
+		}
+	}
+
+	recordsByRaw := make(map[string][]traeTraceRecord)
+	for traceID, record := range recordsByTrace {
+		rawSessionID, exists := traceToRawSession[traceID]
+		if !exists {
+			continue
+		}
+		record.RawSessionID = rawSessionID
+		if !record.HasChatStart {
+			continue
+		}
+		if record.AssistantMessageID == "" || record.UserMessageID == "" || record.Timestamp.IsZero() {
+			continue
+		}
+		recordsByRaw[record.RawSessionID] = append(recordsByRaw[record.RawSessionID], *record)
+	}
+
+	for rawSessionID := range recordsByRaw {
+		sort.SliceStable(recordsByRaw[rawSessionID], func(i, j int) bool {
+			left := recordsByRaw[rawSessionID][i]
+			right := recordsByRaw[rawSessionID][j]
+			if !left.Timestamp.Equal(right.Timestamp) {
+				return left.Timestamp.Before(right.Timestamp)
+			}
+			return left.TraceID < right.TraceID
+		})
+	}
+
+	return recordsByRaw, nil
+}
+
+func scanTraeLogFileForRecords(index int, logFile string, rawSessionIDs map[string]struct{}, tailLimitBytes int64) traeTraceScanResult {
+	localTraceToRaw := make(map[string]string)
+	localRecords := make(map[string]traeTraceRecordPartial)
+	scanErr := scanTraeLogFile(logFile, tailLimitBytes, func(line string) {
+		if !strings.Contains(line, "trace_id") {
+			return
+		}
+
+		traceID := extractTraeTraceID(line)
+		if traceID == "" {
+			return
+		}
+
+		if lineMayContainTraeSessionID(line) {
+			rawSessionID := extractAllowedRawSessionID(line, rawSessionIDs)
+			if rawSessionID != "" {
+				if _, exists := localTraceToRaw[traceID]; !exists {
+					localTraceToRaw[traceID] = rawSessionID
+				}
+			}
+		}
+
+		partial, ok := parseTraeTraceRecordPartial(line)
+		if !ok {
+			return
+		}
+
+		record := localRecords[traceID]
+		mergeTraeTraceRecordPartialState(&record, partial)
+		localRecords[traceID] = record
+	})
+
+	return traeTraceScanResult{
+		TraceToRaw: localTraceToRaw,
+		Records:    localRecords,
+		Err:        scanErr,
+	}
+}
+
+func runTraeLogWorkers[T any](logFiles []string, scan func(index int, logFile string) T) ([]T, error) {
+	results := make([]T, len(logFiles))
+	if len(logFiles) == 0 {
+		return results, nil
+	}
+
+	workerCount := parallelTraeLogWorkerCount(len(logFiles))
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+
+	for worker := 0; worker < workerCount; worker += 1 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				results[index] = scan(index, logFiles[index])
+			}
+		}()
+	}
+
+	for index := range logFiles {
+		jobs <- index
+	}
+	close(jobs)
+	wg.Wait()
+	return results, nil
+}
+
+func parallelTraeLogWorkerCount(fileCount int) int {
+	if fileCount <= 1 {
+		return 1
+	}
+
+	workerCount := runtime.GOMAXPROCS(0)
+	if workerCount < 2 {
+		workerCount = 2
+	}
+	if workerCount > 8 {
+		workerCount = 8
+	}
+	if workerCount > fileCount {
+		return fileCount
+	}
+	return workerCount
+}
+
+func parallelTraeWorkspaceWorkerCount(entryCount int) int {
+	if entryCount <= 1 {
+		return 1
+	}
+
+	workerCount := runtime.GOMAXPROCS(0)
+	if workerCount < 2 {
+		workerCount = 2
+	}
+	if workerCount > 12 {
+		workerCount = 12
+	}
+	if workerCount > entryCount {
+		return entryCount
+	}
+	return workerCount
+}
+
+func scanTraeLogFile(logFile string, tailLimitBytes int64, handleLine func(line string)) error {
+	file, err := os.Open(logFile)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	if tailLimitBytes > 0 {
+		info, statErr := file.Stat()
+		if statErr != nil {
+			return statErr
+		}
+		if info.Size() > tailLimitBytes {
+			return scanTraeLogFileTail(file, info.Size(), tailLimitBytes, handleLine)
+		}
+	}
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	for scanner.Scan() {
+		handleLine(scanner.Text())
+	}
+	return scanner.Err()
+}
+
+func scanTraeLogFileTail(file *os.File, fileSize, maxBytes int64, handleLine func(line string)) error {
+	offset := fileSize - maxBytes
+	if offset < 0 {
+		offset = 0
+	}
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		return err
+	}
+
+	reader := bufio.NewReader(io.LimitReader(file, maxBytes))
+	if offset > 0 {
+		if _, err := reader.ReadString('\n'); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+	}
+
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	for scanner.Scan() {
+		handleLine(scanner.Text())
+	}
+	return scanner.Err()
+}
+
+func extractTraeTraceID(line string) string {
+	matches := traeTraceIDPattern.FindStringSubmatch(line)
+	if len(matches) != 2 {
+		return ""
+	}
+	return matches[1]
+}
+
+func extractAllowedRawSessionID(line string, allowed map[string]struct{}) string {
+	matches := traeSessionLikePattern.FindAllStringSubmatch(line, -1)
+	for _, match := range matches {
+		if len(match) != 2 {
+			continue
+		}
+		if _, exists := allowed[match[1]]; exists {
+			return match[1]
+		}
+	}
+	return ""
+}
+
+func lineMayContainTraeSessionID(line string) bool {
+	return strings.Contains(line, "chat_session_id: ") ||
+		strings.Contains(line, "session_id=") ||
+		strings.Contains(line, "chain_id=")
+}
+
+func extractTraeTimestamp(line string) (time.Time, bool) {
+	matches := traeTimestampPattern.FindStringSubmatch(line)
+	if len(matches) != 2 {
+		return time.Time{}, false
+	}
+	if timestamp, err := time.Parse(time.RFC3339Nano, matches[1]); err == nil {
+		return timestamp, true
+	}
+	if timestamp, err := time.Parse("2006-01-02T15:04:05", matches[1]); err == nil {
+		return timestamp, true
+	}
+	return time.Time{}, false
+}
+
+func parseTraeTraceRecordPartial(line string) (traeTraceRecordPartial, bool) {
+	record := traeTraceRecordPartial{}
+	updated := false
+
+	if strings.Contains(line, `service: "chat", method: "chat"`) {
+		record.HasChatStart = true
+		updated = true
+		if timestamp, ok := extractTraeTimestamp(line); ok {
+			record.Timestamp = timestamp
+		}
+	}
+
+	if strings.Contains(line, "[ChatService] create message") {
+		if matches := traeCreateMessageIDPattern.FindStringSubmatch(line); len(matches) == 2 {
+			record.UserMessageID = matches[1]
+			updated = true
+		}
+	}
+
+	if strings.Contains(line, "task_id=") {
+		if matches := traeAssistantTaskMessageIDPattern.FindStringSubmatch(line); len(matches) == 2 {
+			record.AssistantMessageID = matches[1]
+			updated = true
+		}
+	}
+
+	if strings.Contains(line, "user_message_id: ") {
+		if matches := traeUserMessageIDFallbackPattern.FindStringSubmatch(line); len(matches) == 2 {
+			record.UserMessageID = matches[1]
+			updated = true
+		}
+	}
+
+	return record, updated
+}
+
+func mergeTraeTraceRecordPartial(record *traeTraceRecord, partial traeTraceRecordPartial) {
+	if partial.HasChatStart {
+		record.HasChatStart = true
+		if record.Timestamp.IsZero() || (!partial.Timestamp.IsZero() && partial.Timestamp.Before(record.Timestamp)) {
+			record.Timestamp = partial.Timestamp
+		}
+	}
+	if record.UserMessageID == "" && partial.UserMessageID != "" {
+		record.UserMessageID = partial.UserMessageID
+	}
+	if record.AssistantMessageID == "" && partial.AssistantMessageID != "" {
+		record.AssistantMessageID = partial.AssistantMessageID
+	}
+}
+
+func mergeTraeTraceRecordPartialState(record *traeTraceRecordPartial, partial traeTraceRecordPartial) {
+	if partial.HasChatStart {
+		record.HasChatStart = true
+		if record.Timestamp.IsZero() || (!partial.Timestamp.IsZero() && partial.Timestamp.Before(record.Timestamp)) {
+			record.Timestamp = partial.Timestamp
+		}
+	}
+	if record.UserMessageID == "" && partial.UserMessageID != "" {
+		record.UserMessageID = partial.UserMessageID
+	}
+	if record.AssistantMessageID == "" && partial.AssistantMessageID != "" {
+		record.AssistantMessageID = partial.AssistantMessageID
+	}
+}
+
+func buildTraeCandidates(workspaces []traeMatchedWorkspace, traceRecordsByRaw map[string][]traeTraceRecord) []ExtractTaskSessionCandidate {
+	built := make([]traeCandidateBuild, 0)
+
+	for _, workspace := range workspaces {
+		if workspace.State.UserID == "" {
+			continue
+		}
+
+		mappedTurnsByRaw := mapTraeInputHistoryToTurns(workspace.State, traceRecordsByRaw)
+		seenRawSessions := make(map[string]struct{})
+		for _, rawSession := range workspace.State.RawSessions {
+			rawSessionID := rawSession.RawSessionID
+			if rawSessionID == "" {
+				continue
+			}
+			if _, exists := seenRawSessions[rawSessionID]; exists {
+				continue
+			}
+			seenRawSessions[rawSessionID] = struct{}{}
+
+			turns := filterMeaningfulTraeTurns(mappedTurnsByRaw[rawSessionID])
+			if len(turns) == 0 {
+				continue
+			}
+
+			extractedSessions := make([]ExtractedTraeSession, 0, len(turns))
+			for index, turn := range turns {
+				extractedSessions = append(extractedSessions, buildExtractedTraeSession(
+					workspace.State.UserID,
+					rawSessionID,
+					turn,
+					(rawSession.IsCurrent || rawSessionID == workspace.State.CurrentRawSessionID) && index == len(turns)-1,
+				))
+			}
+
+			lastActivityAt := extractedSessions[len(extractedSessions)-1].LastActivityAt
+			built = append(built, traeCandidateBuild{
+				Candidate: ExtractTaskSessionCandidate{
+					ID:               fmt.Sprintf("%s:%s", workspace.WorkspaceHash, rawSessionID),
+					WorkspacePath:    workspace.WorkspacePath,
+					MatchedPath:      workspace.MatchedPath,
+					MatchKind:        workspace.MatchKind,
+					SessionCount:     len(extractedSessions),
+					UserID:           workspace.State.UserID,
+					Username:         workspace.State.Username,
+					CurrentSessionID: workspace.State.CurrentRawSessionID,
+					UserMessageCount: len(extractedSessions),
+					Summary:          summarizeTraeTurns(turns),
+					LastActivityAt:   lastActivityAt,
+					Sessions:         extractedSessions,
+				},
+				MatchScore: workspace.MatchScore,
+				IsCurrent:  rawSession.IsCurrent || rawSessionID == workspace.State.CurrentRawSessionID,
+			})
+		}
+	}
+
+	sort.SliceStable(built, func(i, j int) bool {
+		if built[i].MatchScore != built[j].MatchScore {
+			return built[i].MatchScore > built[j].MatchScore
+		}
+		if built[i].IsCurrent != built[j].IsCurrent {
+			return built[i].IsCurrent
+		}
+		leftAt := int64(0)
+		if built[i].Candidate.LastActivityAt != nil {
+			leftAt = *built[i].Candidate.LastActivityAt
+		}
+		rightAt := int64(0)
+		if built[j].Candidate.LastActivityAt != nil {
+			rightAt = *built[j].Candidate.LastActivityAt
+		}
+		if leftAt != rightAt {
+			return leftAt > rightAt
+		}
+		if built[i].Candidate.SessionCount != built[j].Candidate.SessionCount {
+			return built[i].Candidate.SessionCount > built[j].Candidate.SessionCount
+		}
+		if built[i].Candidate.WorkspacePath != built[j].Candidate.WorkspacePath {
+			return built[i].Candidate.WorkspacePath < built[j].Candidate.WorkspacePath
+		}
+		return built[i].Candidate.ID < built[j].Candidate.ID
+	})
+
+	candidates := make([]ExtractTaskSessionCandidate, 0, len(built))
+	for _, item := range built {
+		candidates = append(candidates, item.Candidate)
+	}
+	return candidates
+}
+
+func mapTraeInputHistoryToTurns(state traeWorkspaceState, traceRecordsByRaw map[string][]traeTraceRecord) map[string][]traeMappedTurn {
+	grouped := make(map[string][]*traeMappedTurn)
+	allTurns := make([]*traeMappedTurn, 0)
+	seenRawSessions := make(map[string]struct{})
+
+	for _, rawSession := range state.RawSessions {
+		rawSessionID := rawSession.RawSessionID
+		if rawSessionID == "" {
+			continue
+		}
+		if _, exists := seenRawSessions[rawSessionID]; exists {
+			continue
+		}
+		seenRawSessions[rawSessionID] = struct{}{}
+
+		for _, record := range traceRecordsByRaw[rawSessionID] {
+			turn := &traeMappedTurn{Record: record}
+			grouped[rawSessionID] = append(grouped[rawSessionID], turn)
+			allTurns = append(allTurns, turn)
+		}
+	}
+
+	sort.SliceStable(allTurns, func(i, j int) bool {
+		left := allTurns[i].Record
+		right := allTurns[j].Record
+		if !left.Timestamp.Equal(right.Timestamp) {
+			return left.Timestamp.Before(right.Timestamp)
+		}
+		if left.RawSessionID != right.RawSessionID {
+			return left.RawSessionID < right.RawSessionID
+		}
+		return left.TraceID < right.TraceID
+	})
+
+	normalizedInputHistory := normalizeTraeInputHistory(state.InputHistory, len(allTurns))
+	for index, inputText := range normalizedInputHistory {
+		if index >= len(allTurns) {
+			break
+		}
+		allTurns[index].UserConversation = inputText
+	}
+
+	result := make(map[string][]traeMappedTurn, len(grouped))
+	for rawSessionID, turns := range grouped {
+		result[rawSessionID] = make([]traeMappedTurn, 0, len(turns))
+		for _, turn := range turns {
+			result[rawSessionID] = append(result[rawSessionID], *turn)
+		}
+	}
+	return result
+}
+
+func normalizeTraeInputHistory(inputHistory []string, turnCount int) []string {
+	trimmedHistory := make([]string, 0, len(inputHistory))
+	for _, inputText := range inputHistory {
+		trimmed := strings.TrimSpace(inputText)
+		if trimmed == "" {
+			continue
+		}
+		trimmedHistory = append(trimmedHistory, trimmed)
+	}
+
+	if len(trimmedHistory) <= turnCount || turnCount <= 0 {
+		return trimmedHistory
+	}
+
+	collapsed := make([]string, 0, len(trimmedHistory))
+	for _, inputText := range trimmedHistory {
+		if len(collapsed) > 0 && collapsed[len(collapsed)-1] == inputText {
+			continue
+		}
+		collapsed = append(collapsed, inputText)
+	}
+
+	if len(collapsed) >= turnCount {
+		return collapsed
+	}
+	return trimmedHistory
+}
+
+func filterMeaningfulTraeTurns(turns []traeMappedTurn) []traeMappedTurn {
+	if len(turns) == 0 {
+		return nil
+	}
+
+	filtered := make([]traeMappedTurn, 0, len(turns))
+	for index, turn := range turns {
+		text := strings.TrimSpace(turn.UserConversation)
+		if index > 0 && text != "" && isTraeNoiseMessage(text) {
+			continue
+		}
+		filtered = append(filtered, turn)
+	}
+	return filtered
+}
+
+func isTraeNoiseMessage(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return false
+	}
+	for _, pattern := range traeNoiseMessagePatterns {
+		if pattern.MatchString(trimmed) {
+			return true
+		}
+	}
+	return false
+}
+
+func buildExtractedTraeSession(userID, rawSessionID string, turn traeMappedTurn, isCurrent bool) ExtractedTraeSession {
+	sessionID := buildTraeFullSessionID(
+		userID,
+		turn.Record.TraceID,
+		rawSessionID,
+		turn.Record.AssistantMessageID,
+		turn.Record.UserMessageID,
+		turn.Record.Timestamp,
+	)
+
+	var lastActivityAt *int64
+	if !turn.Record.Timestamp.IsZero() {
+		timestamp := turn.Record.Timestamp.Unix()
+		lastActivityAt = &timestamp
+	}
+
+	userConversation := strings.TrimSpace(turn.UserConversation)
+	return ExtractedTraeSession{
+		SessionID:        sessionID,
+		UserConversation: userConversation,
+		UserMessageCount: 1,
+		FirstUserMessage: userConversation,
+		LastActivityAt:   lastActivityAt,
+		IsCurrent:        isCurrent,
+	}
+}
+
+func buildTraeFullSessionID(userID, traceID, rawSessionID, assistantMessageID, userMessageID string, timestamp time.Time) string {
+	return fmt.Sprintf(
+		".%s:%s_%s.%s.%s:Trae CN.T(%s)",
+		userID,
+		traceID,
+		rawSessionID,
+		assistantMessageID,
+		userMessageID,
+		formatTraeTimestamp(timestamp),
+	)
+}
+
+func formatTraeTimestamp(timestamp time.Time) string {
+	if timestamp.IsZero() {
+		return ""
+	}
+	return fmt.Sprintf(
+		"%d/%d/%d %d:%02d:%02d",
+		timestamp.Year(),
+		int(timestamp.Month()),
+		timestamp.Day(),
+		timestamp.Hour(),
+		timestamp.Minute(),
+		timestamp.Second(),
+	)
+}
+
+func summarizeTraeTurns(turns []traeMappedTurn) string {
+	for _, turn := range turns {
+		text := strings.TrimSpace(turn.UserConversation)
+		if text == "" {
+			continue
+		}
+		return truncateTraeSummary(text, 120)
+	}
+	return "未提取到对话摘要"
+}
+
+func truncateTraeSummary(text string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(strings.TrimSpace(text))
+	if len(runes) <= limit {
+		return string(runes)
+	}
+	return string(runes[:limit]) + "…"
+}
