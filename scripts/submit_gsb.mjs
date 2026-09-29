@@ -16,6 +16,7 @@ import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
+import { homedir } from 'node:os';
 
 const SUBMIT_URL = 'https://solo2.jzxhnh.com/app/gsb/submit';
 const REQUIRED_HEADERS = [
@@ -28,10 +29,12 @@ const REQUIRED_HEADERS = [
   '操作系统',
   '环境可复现等级',
   '初始环境快照',
+  'A-模型名称',
   'A-SessionID',
   'A-轨迹文件',
   'A-产物快照',
   'A-运行录屏',
+  'B-模型名称',
   'B-SessionID',
   'B-轨迹文件',
   'B-产物快照',
@@ -52,6 +55,11 @@ const FILE_FIELDS = [
   ['B-轨迹文件', 'B-轨迹文件', 27 * 1024 * 1024, ['.jsonl']],
   ['B-运行录屏', 'B-运行录屏', 500 * 1024 * 1024, ['.mp4', '.mov', '.webm', '.m4v']],
 ];
+
+const EXPECTED_MODEL_NAMES = {
+  'A-模型名称': 'auto_model/urm',
+  'B-模型名称': 'ark/urm-03',
+};
 
 const PYTHON_READ_WORKBOOK = String.raw`
 import json
@@ -109,7 +117,7 @@ print(json.dumps({"sheet": selected.title, "rows": rows}, ensure_ascii=False))
 function parseArgs(argv) {
   const args = {
     excel: null,
-    excelDir: process.env.GSB_EXCEL_DIR || '/Users/zqj/.pinru/annotation/exports',
+    excelDir: process.env.GSB_EXCEL_DIR || path.join(homedir(), '.pinru', 'annotation', 'exports'),
     sheet: null,
     submit: false,
     yes: false,
@@ -157,7 +165,7 @@ function printHelp() {
 
 选项：
   --excel PATH       指定工作簿；省略时从 --excel-dir 递归选择最新的有效 GSB xlsx
-  --excel-dir PATH   自动找 Excel 的目录，默认 /Users/zqj/.pinru/annotation/exports
+  --excel-dir PATH   自动找 Excel 的目录，默认 ~/.pinru/annotation/exports
   --sheet NAME       指定工作表；省略时自动寻找包含完整表头的工作表
   --submit           执行登录、填表、自动上传附件并提交
   --yes              跳过提交前确认，仅建议在人工核对过摘要后使用
@@ -170,7 +178,16 @@ function printHelp() {
 }
 
 function bundledPython() {
-  const candidate = '/Users/zqj/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3';
+  const candidate = process.env.GSB_PYTHON || path.join(
+    homedir(),
+    '.cache',
+    'codex-runtimes',
+    'codex-primary-runtime',
+    'dependencies',
+    'python',
+    'bin',
+    'python3',
+  );
   return fsSync.existsSync(candidate) ? candidate : 'python3';
 }
 
@@ -283,6 +300,10 @@ async function validateRows(rows, workbookPath) {
     if (nonEmpty(row['A-SessionID']) === nonEmpty(row['B-SessionID'])) {
       errors.push(`Excel 第 ${excelRow} 行 A-SessionID 与 B-SessionID 相同`);
     }
+    for (const [header, expected] of Object.entries(EXPECTED_MODEL_NAMES)) {
+      const actual = nonEmpty(row[header]);
+      if (actual && actual !== expected) errors.push(`Excel 第 ${excelRow} 行 ${header} 应为 ${expected}，实际为 ${actual}`);
+    }
     for (const header of COMPLETENESS_FIELDS) {
       const raw = nonEmpty(row[header]);
       if (!raw) continue;
@@ -326,7 +347,7 @@ function printRows(workbook, rows) {
   console.log(`工作表：${workbook.sheet}，数据行：${rows.length}`);
   for (const row of rows) {
     const prompt = nonEmpty(row['User Prompt']).replace(/\s+/g, ' ');
-    console.log(`- Excel 第 ${row.__excel_row} 行 | ${row['GSB 结论']} | A=${row['A-SessionID']}(${row['A-交付完整性']}/5) | B=${row['B-SessionID']}(${row['B-交付完整性']}/5) | ${prompt.slice(0, 70)}${prompt.length > 70 ? '…' : ''}`);
+    console.log(`- Excel 第 ${row.__excel_row} 行 | ${row['GSB 结论']} | A=${row['A-模型名称']}/${row['A-SessionID']}(${row['A-交付完整性']}/5) | B=${row['B-模型名称']}/${row['B-SessionID']}(${row['B-交付完整性']}/5) | ${prompt.slice(0, 70)}${prompt.length > 70 ? '…' : ''}`);
   }
 }
 
@@ -346,7 +367,15 @@ function loadPlaywright() {
   try {
     return createRequire(import.meta.url)('playwright');
   } catch (firstError) {
-    const bundledModules = process.env.PLAYWRIGHT_NODE_MODULES || '/Users/zqj/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules';
+    const bundledModules = process.env.PLAYWRIGHT_NODE_MODULES || path.join(
+      homedir(),
+      '.cache',
+      'codex-runtimes',
+      'codex-primary-runtime',
+      'dependencies',
+      'node',
+      'node_modules',
+    );
     try {
       return createRequire(path.join(bundledModules, '__gsb_loader__.cjs'))('playwright');
     } catch {
@@ -458,10 +487,12 @@ async function fillRow(page, row) {
   await chooseCombo(page, '操作系统', nonEmpty(row['操作系统']));
   await chooseCombo(page, '环境可复现等级', nonEmpty(row['环境可复现等级']));
   await text('初始环境快照').fill(nonEmpty(row['初始环境快照']));
+  await chooseCombo(page, 'A-模型名称', nonEmpty(row['A-模型名称']));
   await text('A-SessionID').fill(nonEmpty(row['A-SessionID']));
   await text('A-产物快照').fill(nonEmpty(row['A-产物快照']));
   await score('A-交付完整性').fill(nonEmpty(row['A-交付完整性']));
   await text('A-交付完整性描述').fill(nonEmpty(row['A-交付完整性描述']));
+  await chooseCombo(page, 'B-模型名称', nonEmpty(row['B-模型名称']));
   await text('B-SessionID').fill(nonEmpty(row['B-SessionID']));
   await text('B-产物快照').fill(nonEmpty(row['B-产物快照']));
   await score('B-交付完整性').fill(nonEmpty(row['B-交付完整性']));

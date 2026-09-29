@@ -22,13 +22,14 @@ FIXED_ZIP_TIME = (1980, 1, 1, 0, 0, 0)
 
 HEADERS = [
     "User Prompt", "任务类型", "任务难度", "语言/框架", "Harness", "Harness 版本",
-    "操作系统", "环境可复现等级", "初始环境快照", "A-SessionID", "A-轨迹文件",
-    "A-产物快照", "A-运行录屏", "B-SessionID", "B-轨迹文件", "B-产物快照",
+    "操作系统", "环境可复现等级", "初始环境快照", "A-模型名称", "A-SessionID", "A-轨迹文件",
+    "A-产物快照", "A-运行录屏", "B-模型名称", "B-SessionID", "B-轨迹文件", "B-产物快照",
     "B-运行录屏", "A-交付完整性", "A-交付完整性描述", "B-交付完整性", "B-交付完整性描述",
     "GSB 结论", "GSB 理由", "有效性", "备注",
 ]
+MODEL_NAMES = {"A": "auto_model/urm", "B": "ark/urm-03"}
 CONCLUSIONS = {"A_better": "A 更好", "B_better": "B 更好", "same": "Same"}
-WIDTHS = [36, 18, 14, 28, 16, 16, 18, 24, 48, 24, 42, 48, 42, 24, 42, 48, 42, 14, 48, 14, 48, 14, 72, 22, 32]
+WIDTHS = [36, 18, 14, 28, 16, 16, 18, 24, 48, 26, 24, 42, 48, 42, 26, 24, 42, 48, 42, 14, 48, 14, 48, 14, 72, 22, 32]
 
 COMPLETENESS_NEGATIVE = re.compile(
     r"(?:未(?:验证|核验|执行|测试|覆盖|完成|实现|交付|达到|满足|通过)"
@@ -145,8 +146,8 @@ def row(case, payload):
         pairwise.get("language", ""),
         pairwise.get("harness", ""), pairwise.get("harnessVersion", ""), pairwise.get("os", ""),
         pairwise.get("environment", ""), case.get("snapshotUrl", ""),
-        run_a.get("sessionId", ""), captured_trace(case, run_a), run_a.get("deliverableUrl", ""),
-        run_a.get("videoPath") or run_a.get("videoUrl", ""), run_b.get("sessionId", ""),
+        MODEL_NAMES["A"], run_a.get("sessionId", ""), captured_trace(case, run_a), run_a.get("deliverableUrl", ""),
+        run_a.get("videoPath") or run_a.get("videoUrl", ""), MODEL_NAMES["B"], run_b.get("sessionId", ""),
         captured_trace(case, run_b), run_b.get("deliverableUrl", ""),
         run_b.get("videoPath") or run_b.get("videoUrl", ""),
         review.get("aCompletenessScore", ""), review.get("aCompletenessDescription", ""),
@@ -199,7 +200,7 @@ def build_sheet(data, data_rows):
         })
         for column, value in enumerate(values):
             if value is not None and value != "":
-                if column in (17, 19):
+                if column in (19, 21):
                     xml_row.append(number_cell(row_number, column, value, 6))
                 else:
                     xml_row.append(inline_cell(row_number, column, value, 6))

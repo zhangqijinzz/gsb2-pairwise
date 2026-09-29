@@ -2,7 +2,7 @@
 
 ## 适用范围
 
-一道题使用相同环境、相同完整 User Prompt 和相同模型配置独立运行两次，分别记为 A、B。每个 Session 只能有一轮有效交互，两次运行组成一条数据。旧版多轮五维评分不适用于本模式。
+一道题在相同环境和相同完整 User Prompt 下独立运行两次，分别记为 A、B。A 的五个模型环境变量都设为 `auto_model/urm`，B 的都设为 `ark/urm-03`。每个 Session 只能有一轮有效交互，两次运行组成一条数据。旧版多轮五维评分不适用于本模式。
 
 来源文档：`【初稿】CC用户反馈标注说明新规范.docx`，SHA-256 `08ff56fee0cccd1389ae71a8a675b2ed7fdbea205246a02482492c3c08e4e1ba`。平台提交页于 2026-09-17 实际核对。
 
@@ -19,30 +19,32 @@
 7. 操作系统
 8. 环境可复现等级
 9. 初始环境快照
-10. A-SessionID
-11. A-轨迹文件
-12. A-产物快照
-13. A-运行录屏
-14. B-SessionID
-15. B-轨迹文件
-16. B-产物快照
-17. B-运行录屏
-18. A-交付完整性
-19. A-交付完整性描述
-20. B-交付完整性
-21. B-交付完整性描述
-22. GSB 结论
-23. GSB 理由
-24. 有效性
-25. 备注（选填）
+10. A-模型名称
+11. A-SessionID
+12. A-轨迹文件
+13. A-产物快照
+14. A-运行录屏
+15. B-模型名称
+16. B-SessionID
+17. B-轨迹文件
+18. B-产物快照
+19. B-运行录屏
+20. A-交付完整性
+21. A-交付完整性描述
+22. B-交付完整性
+23. B-交付完整性描述
+24. GSB 结论
+25. GSB 理由
+26. 有效性
+27. 备注（选填）
 
 除 A/B 运行录屏和备注外，其余字段均为必填。环境可复现等级只能为已容器化，可一键起环境、无外部依赖、有外部依赖，未容器化；未单独选择时默认填写已容器化，可一键起环境。任务难度只能为困难或地狱。Harness 使用实际值，只能为 Claude Code 或 Codex CLI。有效性只能为有效、作废-工程故障、作废-环境未重置、作废-其他。
 
 ## 运行与快照
 
 - A、B 使用两个不同容器和两个不同 SessionID。
-- 镜像、API Key、模型配置、max context token、Harness、Harness 版本、机器、操作系统和 User Prompt 保持一致。
-- 全程使用 auto 模型，max context token 固定为 1000000。
+- 镜像、API Key、max context token、Harness、Harness 版本、机器、操作系统和 User Prompt 保持一致；模型配置按 A/B 分别固定。
+- `ANTHROPIC_MODEL`、`ANTHROPIC_DEFAULT_OPUS_MODEL`、`ANTHROPIC_DEFAULT_SONNET_MODEL`、`ANTHROPIC_DEFAULT_HAIKU_MODEL` 和 `CLAUDE_CODE_SUBAGENT_MODEL` 在同一侧使用相同值：A 为 `auto_model/urm`，B 为 `ark/urm-03`；max context token 固定为 1000000。
 - 两次运行共用一个初始环境快照。
 - 远端仓库只有主分支 main 或 master，以及大写 A、B，共三个分支。预检必须读取远端实际引用，确认 `refs/heads/A`、`refs/heads/B` 存在且分别指向登记的 A、B 产物 SHA；小写或其他别名不算通过。
 - A、B 产物各自使用完整 40 位 SHA 的 commit permalink，且产物提交的直接父提交必须是初始环境快照。

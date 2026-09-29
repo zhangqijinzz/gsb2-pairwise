@@ -20,6 +20,14 @@ export function buildContainerCommand(task: TaskIdentity, apiKey = '', side?: Pa
   const suffix = side ? `-${side.toLowerCase()}` : '';
   const containerName = `${prefix}-claude-${sequence}${suffix}`;
   const runDirectory = `run-${sequence}${suffix}`;
+  const anthropicModel = side === 'A' ? 'auto_model/urm' : side === 'B' ? 'ark/urm-03' : '';
+  const modelEnvironment = anthropicModel ? [
+    `-e "ANTHROPIC_MODEL=${anthropicModel}"`,
+    `-e "ANTHROPIC_DEFAULT_OPUS_MODEL=${anthropicModel}"`,
+    `-e "ANTHROPIC_DEFAULT_SONNET_MODEL=${anthropicModel}"`,
+    `-e "ANTHROPIC_DEFAULT_HAIKU_MODEL=${anthropicModel}"`,
+    `-e "CLAUDE_CODE_SUBAGENT_MODEL=${anthropicModel}"`,
+  ].join(' ') : '';
   const command = [
     '(',
     `CONTAINER_NAME="${containerName}"`,
@@ -40,7 +48,7 @@ export function buildContainerCommand(task: TaskIdentity, apiKey = '', side?: Pa
     'mkdir "$RUN_DIR" && \\',
     'mkdir "$RUN_DIR/workspace" && \\',
     'printf \'容器：%s\\n本题本地目录：%s\\n\' "$CONTAINER_NAME" "$RUN_DIR" && \\',
-    'docker run -it --init --restart=no --cap-drop ALL --security-opt no-new-privileges --name "$CONTAINER_NAME" --mount "type=bind,src=$RUN_DIR/workspace,dst=/workspace" -e apikey adminfather/benzhi-claude-code2:20260919',
+    `docker run -it --init --restart=no --cap-drop ALL --security-opt no-new-privileges --name "$CONTAINER_NAME" --mount "type=bind,src=$RUN_DIR/workspace,dst=/workspace" -e apikey${modelEnvironment ? ` ${modelEnvironment}` : ''} adminfather/benzhi-claude-code2:20260919`,
     ')',
   ].join('\n');
   return { containerName, baseDirectory: `$HOME/${prefix}-claude-runs`, runDirectory, command };
